@@ -613,28 +613,57 @@ async def stream_transcode(request: Request):
 
     logger.info(f"Streaming transcode: {' '.join(cmd)}")
 
+    # Track the ffmpeg process so we can kill it on disconnect
+    ffmpeg_proc = None
+
     async def generate():
+        nonlocal ffmpeg_proc
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        ffmpeg_proc = process
+        got_first_data = False
 
         try:
             while True:
-                chunk = await process.stdout.read(65536)  # 64KB chunks
+                # Long timeout initially (ffmpeg needs to seek/probe), shorter once streaming
+                timeout = 120 if not got_first_data else 30
+                try:
+                    chunk = await asyncio.wait_for(process.stdout.read(65536), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.info(f"Stream timeout - no data for {timeout}s, killing ffmpeg")
+                    break
                 if not chunk:
                     break
+                got_first_data = True
                 yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.info("Stream client disconnected")
         finally:
             if process.returncode is None:
-                process.terminate()
-                await process.wait()
+                logger.info(f"Killing ffmpeg process {process.pid}")
+                process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.warning(f"ffmpeg {process.pid} did not exit after kill")
+            ffmpeg_proc = None
 
-    return StreamingResponse(
+    async def on_disconnect_cleanup(response):
+        """Ensure ffmpeg is killed if client disconnects."""
+        if ffmpeg_proc and ffmpeg_proc.returncode is None:
+            logger.info(f"Cleanup: killing orphaned ffmpeg {ffmpeg_proc.pid}")
+            ffmpeg_proc.kill()
+
+    response = StreamingResponse(
         generate(),
         media_type="video/mp2t" if output_format == "mpegts" else "application/octet-stream"
     )
+    response.background = BackgroundTasks()
+    response.background.add_task(on_disconnect_cleanup, response)
+    return response
 
 
 @app.get("/segments/{job_id}/{filename}")
