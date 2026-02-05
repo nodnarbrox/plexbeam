@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Package cartridge
+        run: |
+          mkdir -p dist
+          cd cartridge
+          tar -czvf ../dist/plexbeam-cartridge-${{ steps.version.outputs.VERSION }}.tar.gz \
+            plex_cartridge.sh \
+            watchdog.sh \
+            install.sh \
+            uninstall.sh \
+            analyze.sh
+
+      - name: Package worker
+        run: |
+          cd worker
+          zip -r ../dist/plexbeam-worker-${{ steps.version.outputs.VERSION }}.zip \
+            worker.py \
+            transcoder.py \
+            config.py \
+            requirements.txt
+
+      - name: Package full release
+        run: |
+          tar -czvf dist/plexbeam-${{ steps.version.outputs.VERSION }}.tar.gz \
+            --exclude='.git' \
+            --exclude='dist' \
+            --exclude='*.pyc' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            --exclude='venv' \
+            cartridge/ \
+            worker/ \
+            protocol/ \
+            docs/ \
+            README.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: PlexBeam v${{ steps.version.outputs.VERSION }}
+          body: |
+            ## PlexBeam v${{ steps.version.outputs.VERSION }}
+
+            ### Downloads
+
+            - **Full Package**: `plexbeam-${{ steps.version.outputs.VERSION }}.tar.gz`
+            - **Cartridge Only**: `plexbeam-cartridge-${{ steps.version.outputs.VERSION }}.tar.gz` (for Plex server)
+            - **Worker Only**: `plexbeam-worker-${{ steps.version.outputs.VERSION }}.zip` (for GPU machine)
+
+            ### Installation
+
+            **On Plex Server (Linux):**
+            ```bash
+            tar -xzf plexbeam-cartridge-${{ steps.version.outputs.VERSION }}.tar.gz
+            sudo ./install.sh --worker http://YOUR_GPU_PC:8765
+            ```
+
+            **On GPU Worker (Windows):**
+            ```powershell
+            Expand-Archive plexbeam-worker-${{ steps.version.outputs.VERSION }}.zip
+            pip install -r requirements.txt
+            python worker.py
+            ```
+
+            See [setup guides](https://github.com/${{ github.repository }}/tree/main/docs) for detailed instructions.
+          files: |
+            dist/plexbeam-${{ steps.version.outputs.VERSION }}.tar.gz
+            dist/plexbeam-cartridge-${{ steps.version.outputs.VERSION }}.tar.gz
+            dist/plexbeam-worker-${{ steps.version.outputs.VERSION }}.zip
+          draft: false
+          prerelease: false
