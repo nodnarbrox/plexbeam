@@ -1,0 +1,27 @@
+# Plex Remote GPU Worker - Dependencies
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Settings management
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Async file operations
+aiofiles>=23.2.0
+
+# HTTP client for fetching from Plex
+httpx>=0.26.0
+
+# File uploads
+python-multipart>=0.0.6
+
+# WebSocket support (included in uvicorn[standard])
+websockets>=12.0
+
+# Process management
+psutil>=5.9.0
+
+# Optional: For running as Windows service
+# pywin32>=306  # Uncomment on Windows

@@ -1,0 +1,53 @@
+# Logs
+*.log
+worker/logs/
+worker/worker_console.log
+
+# Temp/build files
+worker/transcode_temp/
+worker/stream_test/
+worker/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+
+# Binary test/media files
+worker/*.mp4
+worker/*.m4s
+worker/init-stream*.m4s
+worker/chunk-stream*.m4s
+
+# Segment files
+*.m4s
+*.m4s.tmp
+*.ts
+
+# Browser snapshots (may contain tokens)
+browser_snapshot.txt
+
+# Baked cartridge copies
+temp_cartridge.sh
+
+# Environment/secrets
+.env
+.env.*
+
+# Windows artifacts
+nul
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Distribution
+dist/

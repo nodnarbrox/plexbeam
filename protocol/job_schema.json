@@ -1,0 +1,238 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Plex Remote GPU Transcode Job",
+  "description": "Schema for transcode jobs dispatched from Plex cartridge to GPU worker",
+  "type": "object",
+  "required": ["job_id", "input", "output", "arguments"],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "description": "Unique identifier for this transcode job (format: YYYYMMDD_HHMMSS_PID)"
+    },
+    "input": {
+      "type": "object",
+      "description": "Input source specification",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["file", "http", "stream"],
+          "description": "How to access the input media"
+        },
+        "path": {
+          "type": "string",
+          "description": "Local file path (for type=file, must be accessible to worker)"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "HTTP URL to stream input from (for type=http)"
+        },
+        "plex_token": {
+          "type": "string",
+          "description": "Plex auth token for accessing media via Plex API"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "description": "Output specification",
+      "required": ["type", "path"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["hls", "dash", "file", "stream"],
+          "description": "Output format type"
+        },
+        "path": {
+          "type": "string",
+          "description": "Output path (directory for segments, file path for single file)"
+        },
+        "manifest": {
+          "type": "string",
+          "description": "Path to manifest file (m3u8 or mpd)"
+        },
+        "segment_duration": {
+          "type": "number",
+          "default": 4,
+          "description": "Segment duration in seconds for HLS/DASH"
+        }
+      }
+    },
+    "arguments": {
+      "type": "object",
+      "description": "Transcoding parameters extracted from Plex",
+      "properties": {
+        "video_codec": {
+          "type": "string",
+          "description": "Output video codec (h264, hevc, copy)"
+        },
+        "audio_codec": {
+          "type": "string",
+          "description": "Output audio codec (aac, copy)"
+        },
+        "video_bitrate": {
+          "type": "string",
+          "description": "Target video bitrate (e.g., '4M', '8000k')"
+        },
+        "audio_bitrate": {
+          "type": "string",
+          "description": "Target audio bitrate (e.g., '128k')"
+        },
+        "resolution": {
+          "type": "string",
+          "description": "Output resolution (e.g., '1920x1080', '1280x720')"
+        },
+        "preset": {
+          "type": "string",
+          "default": "fast",
+          "description": "Encoder preset (ultrafast, superfast, veryfast, faster, fast, medium)"
+        },
+        "hw_accel": {
+          "type": "string",
+          "enum": ["qsv", "nvenc", "vaapi", "none"],
+          "default": "qsv",
+          "description": "Hardware acceleration to use"
+        },
+        "seek": {
+          "type": "number",
+          "description": "Seek position in seconds"
+        },
+        "duration": {
+          "type": "number",
+          "description": "Duration to transcode in seconds"
+        },
+        "filters": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "FFmpeg filter chains to apply"
+        },
+        "subtitle": {
+          "type": "object",
+          "description": "Subtitle handling",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["burn", "copy", "none"],
+              "description": "How to handle subtitles"
+            },
+            "path": {
+              "type": "string",
+              "description": "Path to external subtitle file"
+            },
+            "stream_index": {
+              "type": "integer",
+              "description": "Subtitle stream index in input"
+            }
+          }
+        },
+        "tone_mapping": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable HDR to SDR tone mapping"
+        },
+        "quality": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 51,
+          "default": 23,
+          "description": "CRF/quality value for encoding"
+        },
+        "raw_args": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Original raw arguments from Plex (for debugging)"
+        }
+      }
+    },
+    "priority": {
+      "type": "integer",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Job priority (1=lowest, 10=highest)"
+    },
+    "timeout": {
+      "type": "integer",
+      "default": 3600,
+      "description": "Maximum job duration in seconds"
+    },
+    "callback_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL to POST status updates to"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Additional metadata about the job",
+      "properties": {
+        "plex_session": {
+          "type": "string",
+          "description": "Plex session ID"
+        },
+        "media_title": {
+          "type": "string",
+          "description": "Title of the media being transcoded"
+        },
+        "client": {
+          "type": "string",
+          "description": "Client device requesting the transcode"
+        },
+        "cartridge_version": {
+          "type": "string",
+          "description": "Version of the cartridge that dispatched this job"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "job_status": {
+      "type": "object",
+      "description": "Status response from worker",
+      "required": ["job_id", "status"],
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "running", "completed", "failed", "cancelled"]
+        },
+        "progress": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Progress percentage"
+        },
+        "current_segment": {
+          "type": "integer",
+          "description": "Current segment being encoded (for HLS/DASH)"
+        },
+        "fps": {
+          "type": "number",
+          "description": "Current encoding FPS"
+        },
+        "speed": {
+          "type": "number",
+          "description": "Encoding speed (1.0 = realtime)"
+        },
+        "eta_seconds": {
+          "type": "integer",
+          "description": "Estimated time remaining in seconds"
+        },
+        "error": {
+          "type": "string",
+          "description": "Error message if status is 'failed'"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
