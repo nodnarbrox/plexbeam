@@ -202,7 +202,7 @@ done
 dispatch_to_remote_worker() {
     local worker_url="${REMOTE_WORKER_URL}"
 
-    if [[ -z "$worker_url" ]] || [[ "$worker_url" == "__REMOTE_WORKER_URL__" ]]; then
+    if [[ -z "$worker_url" ]] || [[ "$worker_url" == __* ]]; then
         return 1  # No worker configured
     fi
 
@@ -339,7 +339,7 @@ USE_REMOTE=false
 REMOTE_SUCCESS=false
 
 # Try remote dispatch first if configured
-if [[ -n "$REMOTE_WORKER_URL" ]] && [[ "$REMOTE_WORKER_URL" != "__REMOTE_WORKER_URL__" ]]; then
+if [[ -n "$REMOTE_WORKER_URL" ]] && [[ "$REMOTE_WORKER_URL" != __* ]]; then
     USE_REMOTE=true
 
     {

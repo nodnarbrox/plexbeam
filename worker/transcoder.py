@@ -265,20 +265,22 @@ class FFmpegTranscoder:
             # Filter Linux VAAPI options (not available on Windows - use QSV instead)
             plex_opts_with_value = {
                 "-loglevel_plex", "-progressurl", "-loglevel",
-                "-delete_removed", "-skip_to_segment", "-manifest_name",
+                "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
                 # Linux VAAPI options
                 "-hwaccel", "-hwaccel:0", "-hwaccel_device", "-hwaccel_device:0",
                 "-init_hw_device", "-filter_hw_device"
             }
             plex_opts_no_value = {"-nostats", "-noaccurate_seek"}
 
-            # Detect if libx264 encoding is requested (we'll use QSV instead)
-            needs_qsv_replace = any(
+            # Detect if libx264 encoding is requested (replace with HW encoder if available)
+            hw_accel = settings.hw_accel
+            needs_hw_replace = hw_accel != "none" and any(
                 job.raw_args[i] in ("-codec:0", "-c:v") and
                 i + 1 < len(job.raw_args) and
                 job.raw_args[i + 1] == "libx264"
                 for i in range(len(job.raw_args))
             )
+            hw_encoder = settings.get_video_encoder()  # maps hw_accel to encoder
 
             # Track if we skip a video filter_complex so we can fix map references
             skipped_video_filter = False
@@ -314,12 +316,12 @@ class FFmpegTranscoder:
                 # Skip any arg containing "vaapi"
                 if "vaapi" in str(arg).lower():
                     continue
-                # Replace libx264 with h264_qsv for Windows QSV encoding
+                # Replace libx264 with HW encoder if hardware acceleration is available
                 # Downscale to 1080p max (community preference: don't transcode at 4K)
-                if needs_qsv_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(job.raw_args) and job.raw_args[i + 1] == "libx264":
+                if needs_hw_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(job.raw_args) and job.raw_args[i + 1] == "libx264":
                     filtered_args.extend([
                         "-vf", "scale=1920:-2",  # 1080p width, auto height (preserves aspect)
-                        "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "26",
+                        "-c:v", hw_encoder, "-preset", "veryfast", "-global_quality", "26",
                         "-maxrate", "10M", "-bufsize", "5M"
                     ])
                     skip_next = True
@@ -347,8 +349,8 @@ class FFmpegTranscoder:
                         continue
                     else:
                         logger.info(f"[{job.job_id}] NOT replacing -map {next_arg} (doesn't match label {video_filter_output_label})")
-                # Skip x264opts (not compatible with QSV)
-                if arg.startswith("-x264opts"):
+                # Skip x264opts when using HW encoding (not compatible with QSV/NVENC)
+                if hw_accel != "none" and arg.startswith("-x264opts"):
                     skip_next = True
                     continue
                 filtered_args.append(arg)

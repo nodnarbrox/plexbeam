@@ -21,7 +21,18 @@ services:
       context: ./cartridge
       dockerfile: Dockerfile
     container_name: plexbeam-plex
-    network_mode: host
+    # Use 'network_mode: host' on Linux for best performance.
+    # On Windows/macOS, use port mappings instead (host networking not supported).
+    ports:
+      - "32400:32400"
+      - "1900:1900/udp"
+      - "5353:5353/udp"
+      - "8324:8324"
+      - "32410:32410/udp"
+      - "32412:32412/udp"
+      - "32413:32413/udp"
+      - "32414:32414/udp"
+      - "32469:32469"
     restart: unless-stopped
     environment:
       - PUID=${PUID:-1000}
@@ -30,7 +41,7 @@ services:
       - VERSION=docker
       - PLEX_CLAIM=${PLEX_CLAIM:-}
       # PlexBeam cartridge settings
-      - PLEXBEAM_WORKER_URL=${PLEXBEAM_WORKER_URL:-http://localhost:8765}
+      - PLEXBEAM_WORKER_URL=${PLEXBEAM_WORKER_URL:-}
       - PLEXBEAM_API_KEY=${PLEXBEAM_API_KEY:-}
       - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
       - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}

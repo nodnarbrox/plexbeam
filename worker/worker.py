@@ -494,7 +494,7 @@ async def stream_transcode(request: Request):
     # Filter Plex-specific args and output format args
     plex_opts_with_value = {
         "-loglevel_plex", "-progressurl", "-loglevel",
-        "-delete_removed", "-skip_to_segment", "-manifest_name",
+        "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
         "-seg_duration", "-dash_segment_type", "-init_seg_name",
         "-media_seg_name", "-window_size",
         # Linux VAAPI options - not available on Windows
