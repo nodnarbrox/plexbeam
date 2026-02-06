@@ -230,7 +230,7 @@ sudo ./install.sh --worker http://GPU_PC:8765
 sudo ./install.sh --worker http://GPU_PC:8765 --api-key your-secret
 
 # With auto-updates from GitHub
-sudo ./install.sh --worker http://GPU_PC:8765 --repo https://github.com/you/plexbeam
+sudo ./install.sh --worker http://GPU_PC:8765 --repo https://github.com/nodnarbrox/plexbeam
 ```
 
 ## Commands
