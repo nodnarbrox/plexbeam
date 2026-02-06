@@ -338,8 +338,9 @@ TRANSCODE_START=$(date +%s%N)
 USE_REMOTE=false
 REMOTE_SUCCESS=false
 
-# Try remote dispatch first if configured
-if [[ -n "$REMOTE_WORKER_URL" ]] && [[ "$REMOTE_WORKER_URL" != __* ]]; then
+# Try remote dispatch first if configured and video transcoding is needed
+# Skip remote for video copy (direct stream) — segments must stay on Plex's filesystem
+if [[ -n "$REMOTE_WORKER_URL" ]] && [[ "$REMOTE_WORKER_URL" != __* ]] && [[ "$VIDEO_CODEC_OUT" != "copy" ]] && [[ -n "$VIDEO_CODEC_OUT" ]]; then
     USE_REMOTE=true
 
     {
