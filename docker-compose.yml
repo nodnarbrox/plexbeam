@@ -4,9 +4,10 @@
 # Runs Plex with the PlexBeam cartridge + a remote GPU worker.
 #
 # Usage:
-#   NVIDIA GPU (Linux):  docker compose --profile nvidia up -d
-#   Intel GPU:           docker compose --profile intel up -d
-#   Plex only:           docker compose up -d plex
+#   NVIDIA GPU (Linux):     docker compose --profile nvidia up -d
+#   Intel QSV (Linux):      docker compose --profile intel up -d
+#   VAAPI-WSL2 (Windows):   docker compose --profile vaapi-wsl up -d
+#   Plex only:              docker compose up -d plex
 #
 # Linux with Intel GPU: also create docker-compose.override.yml to add
 #   /dev/dri passthrough (see .env.example for details).
@@ -106,3 +107,35 @@ services:
       - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
       - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
       - ${MEDIA_PATH:-/mnt/media}:/media:ro
+
+  # --- GPU Worker: VAAPI-WSL2 (Windows with Intel/AMD GPU) ---
+  # Uses Mesa D3D12 backend for GPU transcoding via WSL2.
+  # Requires Windows 11 (or 10 21H2+), Intel 11th Gen+ or AMD GPU, and WSL2.
+  # Prerequisites: run 'modprobe drm && modprobe vgem' in WSL2 (or add to /etc/wsl.conf)
+  worker-vaapi-wsl:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.vaapi-wsl
+    container_name: plexbeam-worker-vaapi-wsl
+    profiles:
+      - vaapi-wsl
+    restart: unless-stopped
+    ports:
+      - "${WORKER_PORT:-8765}:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=vaapi
+      - PLEX_WORKER_QSV_DEVICE=/dev/dri/renderD128
+      - PLEX_WORKER_API_KEY=${PLEXBEAM_API_KEY:-}
+      - PLEX_WORKER_MAX_JOBS=${WORKER_MAX_JOBS:-3}
+      - PLEX_WORKER_HOST=0.0.0.0
+      - PLEX_WORKER_PORT=8765
+      - LIBVA_DRIVER_NAME=d3d12
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    devices:
+      - /dev/dxg:/dev/dxg
+      - /dev/dri:/dev/dri
+    volumes:
+      - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
+      - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
+      - /usr/lib/wsl:/usr/lib/wsl:ro

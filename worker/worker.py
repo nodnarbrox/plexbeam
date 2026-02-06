@@ -550,8 +550,8 @@ async def stream_transcode(request: Request):
             continue
         if arg in plex_opts_no_value:
             continue
-        # Skip VAAPI-specific args (value contains vaapi)
-        if "vaapi" in str(arg).lower():
+        # Skip Plex's Linux VAAPI args (we add our own based on hw_accel setting)
+        if "vaapi" in str(arg).lower() and settings.hw_accel != "vaapi":
             continue
         # Skip -f dash/hls (we'll add our own -f mpegts)
         if arg == "-f" and i + 1 < len(raw_args) and raw_args[i + 1] in ("dash", "hls"):
@@ -562,24 +562,42 @@ async def stream_transcode(request: Request):
             continue
         # If HEVC input with video copy, transcode to H.264 instead for browser compatibility
         if is_hevc_input and has_video_copy and arg == "-codec:0" and i + 1 < len(raw_args) and raw_args[i + 1] == "copy":
-            # Replace -codec:0 copy with H.264 QSV encoding - low latency settings
+            hw_encoder = settings.get_video_encoder()
+            hw_accel = settings.hw_accel
             # Downscale to 1080p max (community preference: don't transcode at 4K)
+            scale_filter = f"scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            encoder_opts = ["-c:v", hw_encoder]
+            if hw_accel == "vaapi":
+                encoder_opts.extend(["-qp", "26"])
+            elif hw_accel == "none":
+                encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
+            else:
+                encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
             filtered_args.extend([
-                "-vf", "scale=1920:-2",  # 1080p width, auto height (preserves aspect)
-                "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "26",
-                "-maxrate", "10M", "-bufsize", "5M",  # Good quality for 1080p
-                "-g", "48", "-bf", "0"  # Keyframe every 2s@24fps, no B-frames
+                "-vf", scale_filter,
+                *encoder_opts,
+                "-maxrate", "10M", "-bufsize", "5M",
+                "-g", "48", "-bf", "0"
             ])
             skip_next = True
             continue
-        # If Linux GPU transcode requested, replace with QSV
+        # If Linux GPU transcode requested, replace with HW encoder
         if needs_video_transcode and arg == "-codec:0" and i + 1 < len(raw_args) and raw_args[i + 1] == "libx264":
-            # Downscale to 1080p max (community preference: don't transcode at 4K)
+            hw_encoder = settings.get_video_encoder()
+            hw_accel = settings.hw_accel
+            scale_filter = f"scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            encoder_opts = ["-c:v", hw_encoder]
+            if hw_accel == "vaapi":
+                encoder_opts.extend(["-qp", "26"])
+            elif hw_accel == "none":
+                encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
+            else:
+                encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
             filtered_args.extend([
-                "-vf", "scale=1920:-2",  # 1080p width, auto height (preserves aspect)
-                "-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "26",
-                "-maxrate", "10M", "-bufsize", "5M",  # Good quality for 1080p
-                "-g", "48", "-bf", "0"  # Keyframe every 2s@24fps, no B-frames
+                "-vf", scale_filter,
+                *encoder_opts,
+                "-maxrate", "10M", "-bufsize", "5M",
+                "-g", "48", "-bf", "0"
             ])
             skip_next = True
             continue
@@ -600,8 +618,8 @@ async def stream_transcode(request: Request):
                 filtered_args.extend(["-map", "0:0"])
                 skip_next = True
                 continue
-        # Skip x264opts (not compatible with QSV)
-        if arg.startswith("-x264opts"):
+        # Skip x264opts when using HW encoding (not compatible with QSV/NVENC/VAAPI)
+        if settings.hw_accel != "none" and arg.startswith("-x264opts"):
             skip_next = True
             continue
         # Replace Plex-specific codec names with standard ffmpeg equivalents

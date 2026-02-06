@@ -20,13 +20,34 @@ if [ "$HW_ACCEL" = "nvenc" ]; then
         echo "    Ensure nvidia-container-toolkit is installed on the host"
         echo "    and the container is started with GPU support."
     fi
-elif [ "$HW_ACCEL" = "qsv" ] || [ "$HW_ACCEL" = "vaapi" ]; then
+elif [ "$HW_ACCEL" = "qsv" ]; then
     if [ -e /dev/dri/renderD128 ]; then
         echo "[+] Render device found: /dev/dri/renderD128"
         ls -la /dev/dri/ 2>/dev/null || true
     else
         echo "[!] WARNING: /dev/dri/renderD128 not found. Intel GPU may not be accessible."
         echo "    Ensure /dev/dri is passed through to the container."
+    fi
+elif [ "$HW_ACCEL" = "vaapi" ]; then
+    if [ -e /dev/dri/renderD128 ]; then
+        echo "[+] Render device found: /dev/dri/renderD128"
+        ls -la /dev/dri/ 2>/dev/null || true
+    else
+        echo "[!] WARNING: /dev/dri/renderD128 not found."
+    fi
+    if [ -e /dev/dxg ]; then
+        echo "[+] WSL2 GPU device found: /dev/dxg"
+    fi
+    if [ -d /usr/lib/wsl/lib ]; then
+        echo "[+] WSL2 libraries found: /usr/lib/wsl/lib"
+    else
+        echo "[!] WARNING: /usr/lib/wsl/lib not mounted. VAAPI D3D12 backend needs this."
+        echo "    Mount with: -v /usr/lib/wsl:/usr/lib/wsl"
+    fi
+    echo "[*] VAAPI driver: ${LIBVA_DRIVER_NAME:-auto}"
+    if command -v vainfo &>/dev/null; then
+        echo "[*] VAAPI info:"
+        vainfo --display drm --device /dev/dri/renderD128 2>&1 | head -20 || true
     fi
 elif [ "$HW_ACCEL" = "none" ]; then
     echo "[*] Software transcoding mode (no GPU)"
@@ -84,4 +105,4 @@ echo "[*] Starting PlexBeam worker on port ${PLEX_WORKER_PORT:-8765}..."
 echo "========================================="
 echo ""
 
-exec python worker.py "$@"
+exec python3 worker.py "$@"

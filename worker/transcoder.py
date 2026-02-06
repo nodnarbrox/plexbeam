@@ -313,8 +313,8 @@ class FFmpegTranscoder:
                     continue
                 if arg in plex_opts_no_value:
                     continue
-                # Skip any arg containing "vaapi"
-                if "vaapi" in str(arg).lower():
+                # Skip Plex's Linux VAAPI args (we add our own based on hw_accel setting)
+                if "vaapi" in str(arg).lower() and hw_accel != "vaapi":
                     continue
                 # Replace libx264 with HW encoder if hardware acceleration is available
                 # Downscale to 1080p max (community preference: don't transcode at 4K)
