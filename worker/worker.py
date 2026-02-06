@@ -604,6 +604,10 @@ async def stream_transcode(request: Request):
         if arg.startswith("-x264opts"):
             skip_next = True
             continue
+        # Replace Plex-specific codec names with standard ffmpeg equivalents
+        if arg == "aac_lc":
+            filtered_args.append("aac")
+            continue
         filtered_args.append(arg)
 
     cmd.extend(filtered_args)
