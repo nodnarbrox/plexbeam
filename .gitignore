@@ -31,6 +31,7 @@ temp_cartridge.sh
 # Environment/secrets
 .env
 .env.*
+!.env.example
 
 # Windows artifacts
 nul
@@ -51,3 +52,6 @@ Thumbs.db
 
 # Distribution
 dist/
+
+# Docker runtime data
+config/

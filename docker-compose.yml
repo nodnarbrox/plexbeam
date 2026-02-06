@@ -1,0 +1,97 @@
+# ============================================================================
+# PlexBeam — Full Stack Docker Compose
+# ============================================================================
+# Runs Plex with the PlexBeam cartridge + a remote GPU worker.
+#
+# Usage:
+#   NVIDIA GPU (Linux):  docker compose --profile nvidia up -d
+#   Intel GPU:           docker compose --profile intel up -d
+#   Plex only:           docker compose up -d plex
+#
+# Linux with Intel GPU: also create docker-compose.override.yml to add
+#   /dev/dri passthrough (see .env.example for details).
+#
+# Copy .env.example to .env and configure before starting.
+# ============================================================================
+
+services:
+  # --- Plex Media Server with PlexBeam Cartridge ---
+  plex:
+    build:
+      context: ./cartridge
+      dockerfile: Dockerfile
+    container_name: plexbeam-plex
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-America/New_York}
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM:-}
+      # PlexBeam cartridge settings
+      - PLEXBEAM_WORKER_URL=${PLEXBEAM_WORKER_URL:-http://localhost:8765}
+      - PLEXBEAM_API_KEY=${PLEXBEAM_API_KEY:-}
+      - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
+      - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
+    volumes:
+      - ${PLEX_CONFIG_PATH:-./config/plex}:/config
+      - ${MEDIA_PATH:-/mnt/media}:/media
+      - ${PLEXBEAM_LOG_PATH:-./config/plex-cartridge-logs}:/var/log/plex-cartridge
+
+  # --- GPU Worker: NVIDIA NVENC ---
+  worker-nvidia:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.nvidia
+    container_name: plexbeam-worker-nvidia
+    profiles:
+      - nvidia
+    restart: unless-stopped
+    ports:
+      - "${WORKER_PORT:-8765}:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=nvenc
+      - PLEX_WORKER_API_KEY=${PLEXBEAM_API_KEY:-}
+      - PLEX_WORKER_MAX_JOBS=${WORKER_MAX_JOBS:-3}
+      - PLEX_WORKER_HOST=0.0.0.0
+      - PLEX_WORKER_PORT=8765
+    volumes:
+      - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
+      - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+
+  # --- GPU Worker: Intel QSV ---
+  # Works on Windows (software fallback) and Linux (GPU via /dev/dri).
+  # On Linux, add /dev/dri passthrough via docker-compose.override.yml:
+  #   services:
+  #     worker-intel:
+  #       devices:
+  #         - /dev/dri:/dev/dri
+  worker-intel:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.intel
+    container_name: plexbeam-worker-intel
+    profiles:
+      - intel
+    restart: unless-stopped
+    ports:
+      - "${WORKER_PORT:-8765}:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=${PLEX_WORKER_HW_ACCEL:-qsv}
+      - PLEX_WORKER_API_KEY=${PLEXBEAM_API_KEY:-}
+      - PLEX_WORKER_MAX_JOBS=${WORKER_MAX_JOBS:-3}
+      - PLEX_WORKER_HOST=0.0.0.0
+      - PLEX_WORKER_PORT=8765
+    volumes:
+      - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
+      - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
