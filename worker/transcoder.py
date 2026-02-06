@@ -118,6 +118,7 @@ class FFmpegTranscoder:
         elif hw_accel == "vaapi":
             device = settings.qsv_device or "/dev/dri/renderD128"
             cmd.extend(["-hwaccel", "vaapi", "-vaapi_device", device])
+            # NOTE: Do NOT add -hwaccel_output_format vaapi here (VGEM/WSL2 KMS limitation)
 
         # Seek position
         if job.seek is not None:
@@ -171,7 +172,7 @@ class FFmpegTranscoder:
             elif hw_accel == "nvenc":
                 cmd.extend(["-vf", f"scale_cuda={width}:{height}"])
             elif hw_accel == "vaapi":
-                cmd.extend(["-vf", f"scale_vaapi=w={width}:h={height}"])
+                cmd.extend(["-vf", f"format=nv12,hwupload,scale_vaapi=w={width}:h={height}"])
             else:
                 cmd.extend(["-vf", f"scale={width}:{height}"])
 
@@ -319,9 +320,17 @@ class FFmpegTranscoder:
                 # Replace libx264 with HW encoder if hardware acceleration is available
                 # Downscale to 1080p max (community preference: don't transcode at 4K)
                 if needs_hw_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(job.raw_args) and job.raw_args[i + 1] == "libx264":
+                    scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+                    encoder_opts = ["-c:v", hw_encoder]
+                    if hw_accel == "vaapi":
+                        encoder_opts.extend(["-qp", "26"])
+                    elif hw_accel == "none":
+                        encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
+                    else:
+                        encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
                     filtered_args.extend([
-                        "-vf", "scale=1920:-2",  # 1080p width, auto height (preserves aspect)
-                        "-c:v", hw_encoder, "-preset", "veryfast", "-global_quality", "26",
+                        "-vf", scale_filter,
+                        *encoder_opts,
                         "-maxrate", "10M", "-bufsize", "5M"
                     ])
                     skip_next = True
@@ -353,11 +362,42 @@ class FFmpegTranscoder:
                 if hw_accel != "none" and arg.startswith("-x264opts"):
                     skip_next = True
                     continue
+                # Skip -preset:0 when using HW encoding (x264/x265 option, not for VAAPI/QSV/NVENC)
+                if hw_accel != "none" and arg == "-preset:0":
+                    skip_next = True
+                    continue
                 # Replace Plex-specific codec names with standard ffmpeg equivalents
                 if arg == "aac_lc":
                     filtered_args.append("aac")
                     continue
+                # Rewrite Plex 'ochl' for old ffmpeg (<5.0) that only knows 'ocl'.
+                # Modern ffmpeg (5.0+) supports 'ochl' natively, so only rewrite if needed.
+                if "ochl=" in arg:
+                    import subprocess as _sp
+                    try:
+                        ver = _sp.check_output([settings.ffmpeg_path, "-version"], stderr=_sp.DEVNULL).decode()
+                        major = int(ver.split("version ")[1].split(".")[0])
+                        if major < 5:
+                            arg = arg.replace("ochl=", "ocl=")
+                    except Exception:
+                        pass  # Keep ochl as-is if version check fails
+                # Apply media path mapping for bare-metal workers
+                if settings.media_path_from and settings.media_path_to:
+                    if arg.startswith(settings.media_path_from):
+                        arg = settings.media_path_to + arg[len(settings.media_path_from):]
                 filtered_args.append(arg)
+
+            # Inject VAAPI hardware acceleration args before -i
+            # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't support
+            # KMS dumb buffer allocation, so full hw decode→encode fails. Instead, decode on
+            # CPU and use format=nv12,hwupload in -vf to upload frames for GPU encoding.
+            if hw_accel == "vaapi" and needs_hw_replace:
+                device = settings.qsv_device or "/dev/dri/renderD128"
+                vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
+                for idx, a in enumerate(filtered_args):
+                    if a == "-i":
+                        filtered_args[idx:idx] = vaapi_init
+                        break
 
             # Add error-level logging so we can see failures
             cmd.extend(["-loglevel", "error"])

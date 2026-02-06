@@ -133,7 +133,9 @@ services:
       - LD_LIBRARY_PATH=/usr/lib/wsl/lib
     devices:
       - /dev/dxg:/dev/dxg
-      - /dev/dri:/dev/dri
+      # Only expose renderD128 (render node), NOT card0 (KMS node).
+      # card0 triggers DRM_IOCTL_MODE_CREATE_DUMB which causes display flickering.
+      - /dev/dri/renderD128:/dev/dri/renderD128
     volumes:
       - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
       - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs

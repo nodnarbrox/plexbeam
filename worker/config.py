@@ -74,6 +74,18 @@ class WorkerSettings(BaseSettings):
         description="Shared directory where Plex can read output segments (SMB/NFS mount)"
     )
 
+    # Media path mapping (for bare-metal workers where Plex container paths differ)
+    # Maps container path prefix to host path prefix.
+    # Example: PLEX_WORKER_MEDIA_PATH_FROM=/media  PLEX_WORKER_MEDIA_PATH_TO=C:/Users/me/media
+    media_path_from: Optional[str] = Field(
+        default=None,
+        description="Container media path prefix to replace (e.g., /media)"
+    )
+    media_path_to: Optional[str] = Field(
+        default=None,
+        description="Host media path to replace with (e.g., C:/Users/me/plex-remote/config/media)"
+    )
+
     # Job settings
     max_concurrent_jobs: int = Field(
         default=2,

@@ -565,7 +565,7 @@ async def stream_transcode(request: Request):
             hw_encoder = settings.get_video_encoder()
             hw_accel = settings.hw_accel
             # Downscale to 1080p max (community preference: don't transcode at 4K)
-            scale_filter = f"scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
             encoder_opts = ["-c:v", hw_encoder]
             if hw_accel == "vaapi":
                 encoder_opts.extend(["-qp", "26"])
@@ -585,7 +585,7 @@ async def stream_transcode(request: Request):
         if needs_video_transcode and arg == "-codec:0" and i + 1 < len(raw_args) and raw_args[i + 1] == "libx264":
             hw_encoder = settings.get_video_encoder()
             hw_accel = settings.hw_accel
-            scale_filter = f"scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
             encoder_opts = ["-c:v", hw_encoder]
             if hw_accel == "vaapi":
                 encoder_opts.extend(["-qp", "26"])
@@ -622,11 +622,40 @@ async def stream_transcode(request: Request):
         if settings.hw_accel != "none" and arg.startswith("-x264opts"):
             skip_next = True
             continue
+        # Skip -preset:0 when using HW encoding (x264/x265 option, not for VAAPI/QSV/NVENC)
+        if settings.hw_accel != "none" and arg == "-preset:0":
+            skip_next = True
+            continue
         # Replace Plex-specific codec names with standard ffmpeg equivalents
         if arg == "aac_lc":
             filtered_args.append("aac")
             continue
+        # Rewrite Plex 'ochl' for old ffmpeg (<5.0) that only knows 'ocl'.
+        if "ochl=" in arg:
+            import subprocess as _sp
+            try:
+                ver = _sp.check_output([settings.ffmpeg_path, "-version"], stderr=_sp.DEVNULL).decode()
+                major = int(ver.split("version ")[1].split(".")[0])
+                if major < 5:
+                    arg = arg.replace("ochl=", "ocl=")
+            except Exception:
+                pass
+        # Apply media path mapping for bare-metal workers
+        if settings.media_path_from and settings.media_path_to:
+            if arg.startswith(settings.media_path_from):
+                arg = settings.media_path_to + arg[len(settings.media_path_from):]
         filtered_args.append(arg)
+
+    # Inject VAAPI hardware acceleration args before -i
+    # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM/WSL2 KMS limitation
+    needs_hw_encode = is_hevc_input or needs_video_transcode
+    if settings.hw_accel == "vaapi" and needs_hw_encode:
+        device = settings.qsv_device or "/dev/dri/renderD128"
+        vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
+        for idx, a in enumerate(filtered_args):
+            if a == "-i":
+                filtered_args[idx:idx] = vaapi_init
+                break
 
     cmd.extend(filtered_args)
 
