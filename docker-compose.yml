@@ -6,8 +6,10 @@
 # Usage:
 #   NVIDIA GPU (Linux):     docker compose --profile nvidia up -d
 #   Intel QSV (Linux):      docker compose --profile intel up -d
-#   VAAPI-WSL2 (Windows):   docker compose --profile vaapi-wsl up -d
 #   Plex only:              docker compose up -d plex
+#
+# NOTE: Intel GPU Docker workers do NOT work on Windows (WSL2 lacks i915/KMS).
+# On Windows, run the worker bare-metal instead (see worker/ directory).
 #
 # Linux with Intel GPU: also create docker-compose.override.yml to add
 #   /dev/dri passthrough (see .env.example for details).
@@ -80,8 +82,8 @@ services:
               count: all
               capabilities: [gpu, video]
 
-  # --- GPU Worker: Intel QSV ---
-  # Works on Windows (software fallback) and Linux (GPU via /dev/dri).
+  # --- GPU Worker: Intel QSV (Linux only) ---
+  # Requires Linux with /dev/dri passthrough. Does NOT work on Windows/WSL2.
   # On Linux, add /dev/dri passthrough via docker-compose.override.yml:
   #   services:
   #     worker-intel:
@@ -107,37 +109,3 @@ services:
       - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
       - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
       - ${MEDIA_PATH:-/mnt/media}:/media:ro
-
-  # --- GPU Worker: VAAPI-WSL2 (Windows with Intel/AMD GPU) ---
-  # Uses Mesa D3D12 backend for GPU transcoding via WSL2.
-  # Requires Windows 11 (or 10 21H2+), Intel 11th Gen+ or AMD GPU, and WSL2.
-  # Prerequisites: run 'modprobe drm && modprobe vgem' in WSL2 (or add to /etc/wsl.conf)
-  worker-vaapi-wsl:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile.vaapi-wsl
-    container_name: plexbeam-worker-vaapi-wsl
-    profiles:
-      - vaapi-wsl
-    restart: unless-stopped
-    ports:
-      - "${WORKER_PORT:-8765}:8765"
-    environment:
-      - PLEX_WORKER_HW_ACCEL=vaapi
-      - PLEX_WORKER_QSV_DEVICE=/dev/dri/renderD128
-      - PLEX_WORKER_API_KEY=${PLEXBEAM_API_KEY:-}
-      - PLEX_WORKER_MAX_JOBS=${WORKER_MAX_JOBS:-3}
-      - PLEX_WORKER_HOST=0.0.0.0
-      - PLEX_WORKER_PORT=8765
-      - LIBVA_DRIVER_NAME=d3d12
-      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
-    devices:
-      - /dev/dxg:/dev/dxg
-      # Only expose renderD128 (render node), NOT card0 (KMS node).
-      # card0 triggers DRM_IOCTL_MODE_CREATE_DUMB which causes display flickering.
-      - /dev/dri/renderD128:/dev/dri/renderD128
-    volumes:
-      - ${WORKER_TEMP_PATH:-./config/worker-temp}:/app/transcode_temp
-      - ${WORKER_LOG_PATH:-./config/worker-logs}:/app/logs
-      - ${MEDIA_PATH:-/mnt/media}:/media:ro
-      - /usr/lib/wsl:/usr/lib/wsl:ro
