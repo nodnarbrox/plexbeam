@@ -1,0 +1,84 @@
+# PlexBeam GPU Worker - Docker Compose
+#
+# NVIDIA:  docker compose up worker-nvidia
+# Intel:   docker compose up worker-intel
+# Combined: docker compose up worker
+#
+# Set your API key and media path before starting:
+#   export PLEX_WORKER_API_KEY=your-secret-key
+#   export MEDIA_PATH=/path/to/your/media
+
+services:
+  # --- NVIDIA NVENC worker ---
+  worker-nvidia:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    container_name: plexbeam-worker-nvidia
+    ports:
+      - "8765:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=nvenc
+      - PLEX_WORKER_MAX_CONCURRENT_JOBS=2
+      - PLEX_WORKER_API_KEY=${PLEX_WORKER_API_KEY:-}
+      - PLEX_WORKER_LOG_LEVEL=INFO
+    volumes:
+      - ./transcode_temp:/app/transcode_temp
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    restart: unless-stopped
+
+  # --- Intel QSV worker ---
+  worker-intel:
+    build:
+      context: .
+      dockerfile: Dockerfile.intel
+    container_name: plexbeam-worker-intel
+    ports:
+      - "8765:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=qsv
+      - PLEX_WORKER_MAX_CONCURRENT_JOBS=2
+      - PLEX_WORKER_API_KEY=${PLEX_WORKER_API_KEY:-}
+      - PLEX_WORKER_LOG_LEVEL=INFO
+    volumes:
+      - ./transcode_temp:/app/transcode_temp
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
+    devices:
+      - /dev/dri:/dev/dri
+    restart: unless-stopped
+
+  # --- Combined worker (NVIDIA + Intel, choose at runtime) ---
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plexbeam-worker
+    ports:
+      - "8765:8765"
+    environment:
+      - PLEX_WORKER_HW_ACCEL=${PLEX_WORKER_HW_ACCEL:-nvenc}
+      - PLEX_WORKER_MAX_CONCURRENT_JOBS=2
+      - PLEX_WORKER_API_KEY=${PLEX_WORKER_API_KEY:-}
+      - PLEX_WORKER_LOG_LEVEL=INFO
+    volumes:
+      - ./transcode_temp:/app/transcode_temp
+      - ${MEDIA_PATH:-/mnt/media}:/media:ro
+    # NVIDIA GPU passthrough
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    # Intel GPU passthrough (uncomment if using QSV)
+    # devices:
+    #   - /dev/dri:/dev/dri
+    restart: unless-stopped

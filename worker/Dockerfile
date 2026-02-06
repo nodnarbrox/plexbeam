@@ -1,0 +1,72 @@
+# PlexBeam GPU Worker - Combined multi-GPU variant
+# Supports both NVIDIA NVENC and Intel QSV in a single image.
+# Larger image but universal — set PLEX_WORKER_HW_ACCEL to choose at runtime.
+#
+# Build:  docker build -t plexbeam-worker .
+# Run (NVIDIA):  docker run --gpus all -p 8765:8765 -e PLEX_WORKER_HW_ACCEL=nvenc plexbeam-worker
+# Run (Intel):   docker run --device /dev/dri:/dev/dri -p 8765:8765 -e PLEX_WORKER_HW_ACCEL=qsv plexbeam-worker
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+LABEL maintainer="PlexBeam"
+LABEL description="PlexBeam GPU Worker with NVIDIA NVENC + Intel QSV support"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Intel media drivers, FFmpeg, and Python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Intel GPU drivers
+    intel-media-va-driver-non-free \
+    libmfx-gen1.2 \
+    libvpl2 \
+    libva-drm2 \
+    libva2 \
+    vainfo \
+    # FFmpeg (includes NVENC + QSV + VAAPI support)
+    ffmpeg \
+    # Python
+    python3.12 \
+    python3.12-venv \
+    python3-pip \
+    # Utilities
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.12 the default python
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Copy worker source
+COPY config.py worker.py transcoder.py ./
+
+# Copy entrypoint
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Create runtime directories
+RUN mkdir -p /app/transcode_temp /app/logs
+
+# Default environment — override PLEX_WORKER_HW_ACCEL at runtime
+ENV PLEX_WORKER_HW_ACCEL=nvenc \
+    PLEX_WORKER_FFMPEG_PATH=ffmpeg \
+    PLEX_WORKER_FFPROBE_PATH=ffprobe \
+    PLEX_WORKER_HOST=0.0.0.0 \
+    PLEX_WORKER_PORT=8765 \
+    PLEX_WORKER_TEMP_DIR=/app/transcode_temp \
+    PLEX_WORKER_LOG_DIR=/app/logs \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    LIBVA_DRIVER_NAME=iHD
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8765/health || exit 1
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
