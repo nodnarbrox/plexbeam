@@ -13,7 +13,7 @@ This guide covers installing the PlexBeam cartridge on your Linux Plex server.
 
 ```bash
 # Clone or download the repository
-git clone https://github.com/yourusername/plexbeam.git
+git clone https://github.com/nodnarbrox/plexbeam.git
 cd plexbeam/cartridge
 
 # Install with remote worker
@@ -54,7 +54,7 @@ sudo ./install.sh \
 ```bash
 sudo ./install.sh \
   --worker http://192.168.1.100:8765 \
-  --repo https://github.com/yourusername/plexbeam
+  --repo https://github.com/nodnarbrox/plexbeam
 ```
 
 ### All Options
@@ -232,35 +232,46 @@ sudo /opt/plex-cartridge/uninstall.sh
 sudo /opt/plex-cartridge/uninstall.sh --purge
 ```
 
-## Docker/LXC Considerations
+## Docker Deployment
 
-### Docker
-
-Mount the cartridge into your Plex container:
-
-```yaml
-volumes:
-  - ./cartridge:/opt/plex-cartridge
-  - ./logs:/var/log/plex-cartridge
-```
-
-Run installer inside container:
+PlexBeam includes a Docker image based on `linuxserver/plex` with the cartridge pre-installed. No manual installation needed -- the S6 overlay init script handles everything automatically on container start.
 
 ```bash
-docker exec -it plex bash
-cd /opt/plex-cartridge
-./install.sh --worker http://host.docker.internal:8765
+# From project root
+cp .env.example .env
+# Edit .env with your settings
+
+# Start Plex with cartridge
+docker compose up -d plex
 ```
+
+The container automatically:
+1. Backs up the real `Plex Transcoder` binary
+2. Bakes your worker URL and API key into the cartridge
+3. Installs the cartridge as the active transcoder
+4. Runs a watchdog that re-installs after Plex updates
+
+To run the full stack with a GPU worker in Docker (Linux only):
+
+```bash
+# NVIDIA GPU worker
+docker compose --profile nvidia up -d
+
+# Intel QSV worker (requires /dev/dri passthrough)
+docker compose --profile intel up -d
+```
+
+See the [README](../README.md) for full Docker configuration details.
 
 ### LXC (Proxmox)
 
-Install directly in the container:
+Install directly in the container using the bare-metal method:
 
 ```bash
-pct exec 106 -- bash -c 'cd /tmp && git clone ... && cd plexbeam/cartridge && ./install.sh'
+pct exec 106 -- bash -c 'cd /tmp && git clone https://github.com/nodnarbrox/plexbeam.git && cd plexbeam/cartridge && ./install.sh --worker http://192.168.1.100:8765'
 ```
 
-Ensure container has network access to worker.
+Ensure the container has network access to the worker.
 
 ## Security Notes
 
