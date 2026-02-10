@@ -379,38 +379,42 @@ fi
 if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
 
     # -----------------------------------------------------------------------
-    # VAAPI hardware encoding rewrite for local fallback
-    # Without Plex Pass, Plex sends libx264 (CPU encode) + CPU scale filters.
-    # This rewrites the full pipeline to use VAAPI GPU encode + GPU scaling,
+    # QSV hardware encoding rewrite for local fallback
+    # Without Plex Pass, Plex sends libx264/libx265 (CPU encode) + CPU scale.
+    # This rewrites the full pipeline to use QSV GPU decode + scale_qsv + encode,
     # so users get hardware transcoding locally without Plex Pass.
     #
+    # Also fixes 3 Plex crash bugs:
+    #   aac_lc → aac (Plex codec name not in system ffmpeg)
+    #   ochl → out_channel_layout (Plex custom audio filter param)
+    #   -time_delta stripped (Plex DASH muxer option)
+    #
     # Rewrites:
-    #   libx264 → h264_vaapi
-    #   scale=w=W:h=H → scale_vaapi=w=W:h=H:format=nv12 (with hwupload)
-    #   Removes -crf, -preset, -x264opts (not supported by h264_vaapi)
-    #   Adds -hwaccel_output_format vaapi (keeps decoded frames on GPU)
-    #   Adds -init_hw_device + -filter_hw_device if missing
-    #   Adds -global_quality 23 for h264_vaapi quality control
+    #   libx264 → h264_qsv, libx265 → hevc_qsv
+    #   scale=w=W:h=H → hwupload + scale_qsv=w=W:h=H
+    #   -crf N → -global_quality (N+2), clamped 1-51
+    #   Removes -preset, -x264opts, -x265-params (not QSV-compatible)
+    #   Adds -init_hw_device qsv=hw + -filter_hw_device hw
     # -----------------------------------------------------------------------
     LOCAL_ARGS=("$@")
-    VAAPI_REWRITE=false
+    QSV_REWRITE=false
 
     if [[ -e /dev/dri/renderD128 ]]; then
-        # Check if libx264 is in the args (no Plex Pass HW encoding)
+        # Check if libx264 or libx265 is in the args (no Plex Pass HW encoding)
         NEEDS_REWRITE=false
         for arg in "${LOCAL_ARGS[@]}"; do
-            if [[ "$arg" == "libx264" ]]; then
+            if [[ "$arg" == "libx264" ]] || [[ "$arg" == "libx265" ]]; then
                 NEEDS_REWRITE=true
                 break
             fi
         done
 
         if [[ "$NEEDS_REWRITE" == "true" ]]; then
-            VAAPI_REWRITE=true
+            QSV_REWRITE=true
             declare -a REWRITTEN_ARGS=()
             SKIP_NEXT=false
-            SCALE_W=""
-            SCALE_H=""
+            CRF_VALUE=""
+            CODEC_REWRITES=""
 
             for i in "${!LOCAL_ARGS[@]}"; do
                 if [[ "$SKIP_NEXT" == "true" ]]; then
@@ -421,45 +425,86 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                 cur_arg="${LOCAL_ARGS[$i]}"
                 nxt_arg="${LOCAL_ARGS[$((i+1))]:-}"
 
-                # Replace libx264 with h264_vaapi
+                # Replace libx264 → h264_qsv
                 if [[ "$cur_arg" == "libx264" ]]; then
-                    REWRITTEN_ARGS+=("h264_vaapi")
+                    REWRITTEN_ARGS+=("h264_qsv")
+                    CODEC_REWRITES="${CODEC_REWRITES} libx264→h264_qsv"
                     continue
                 fi
 
-                # Skip x264-specific options (flag + value pairs)
-                if [[ "$cur_arg" == -x264opts* ]] || [[ "$cur_arg" == -preset* ]]; then
+                # Replace libx265 → hevc_qsv
+                if [[ "$cur_arg" == "libx265" ]]; then
+                    REWRITTEN_ARGS+=("hevc_qsv")
+                    CODEC_REWRITES="${CODEC_REWRITES} libx265→hevc_qsv"
+                    continue
+                fi
+
+                # Fix aac_lc → aac (Plex codec name not in system ffmpeg)
+                if [[ "$cur_arg" == "aac_lc" ]]; then
+                    REWRITTEN_ARGS+=("aac")
+                    CODEC_REWRITES="${CODEC_REWRITES} aac_lc→aac"
+                    continue
+                fi
+
+                # Fix ochl → out_chlayout in audio filter_complex values
+                if [[ "$cur_arg" == *"ochl="* ]]; then
+                    REWRITTEN_ARGS+=("${cur_arg//ochl=/out_chlayout=}")
+                    continue
+                fi
+
+                # Skip x264/x265-specific options (flag + value pairs)
+                if [[ "$cur_arg" == -x264opts* ]] || [[ "$cur_arg" == -x265-params* ]] || [[ "$cur_arg" == -preset* ]]; then
                     SKIP_NEXT=true
+                    CODEC_REWRITES="${CODEC_REWRITES} strip:${cur_arg}"
                     continue
                 fi
 
-                # Replace -crf with -global_quality (VAAPI equivalent)
+                # Extract CRF value then replace with global_quality (crf + 2)
                 if [[ "$cur_arg" == -crf* ]]; then
+                    CRF_VALUE="$nxt_arg"
+                    if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then
+                        GQ=$((CRF_VALUE + 2))
+                        (( GQ < 1 )) && GQ=1
+                        (( GQ > 51 )) && GQ=51
+                    else
+                        GQ=21  # fallback: CRF 19 default → 21
+                    fi
                     REWRITTEN_ARGS+=("-global_quality:0")
-                    REWRITTEN_ARGS+=("23")
+                    REWRITTEN_ARGS+=("$GQ")
                     SKIP_NEXT=true
+                    CODEC_REWRITES="${CODEC_REWRITES} crf:${CRF_VALUE}→gq:${GQ}"
                     continue
                 fi
 
-                # Fix broken -init_hw_device vaapi=vaapi: (no device path)
-                if [[ "$cur_arg" == "-init_hw_device" ]] && [[ "$nxt_arg" == "vaapi=vaapi:" ]]; then
+                # Replace any existing -init_hw_device with QSV
+                if [[ "$cur_arg" == "-init_hw_device" ]]; then
                     REWRITTEN_ARGS+=("-init_hw_device")
-                    REWRITTEN_ARGS+=("vaapi=vaapi:/dev/dri/renderD128")
+                    REWRITTEN_ARGS+=("qsv=hw")
                     SKIP_NEXT=true
                     continue
                 fi
 
-                # Rewrite video filter_complex: keep CPU scale, add hwupload for GPU encode
-                # Note: scale_vaapi requires VPP (VAEntrypointVideoProc) which some iHD
-                # drivers don't expose. CPU scale + hwupload + h264_vaapi encode is reliable.
+                # Replace -filter_hw_device value with QSV device name
+                if [[ "$cur_arg" == "-filter_hw_device" ]]; then
+                    REWRITTEN_ARGS+=("-filter_hw_device")
+                    REWRITTEN_ARGS+=("hw")
+                    SKIP_NEXT=true
+                    continue
+                fi
+
+                # Rewrite video filter_complex: hwupload + scale_qsv pipeline
                 if [[ "$cur_arg" == "-filter_complex" ]] && [[ "$nxt_arg" == *"scale=w="* ]] && [[ "$nxt_arg" == "[0:0]"* ]]; then
                     SCALE_W=$(echo "$nxt_arg" | grep -oP 'scale=w=\K\d+')
                     SCALE_H=$(echo "$nxt_arg" | grep -oP ':h=\K\d+')
+                    # Extract output label from original filter (e.g. [1], [vout])
+                    FILTER_LABEL=$(echo "$nxt_arg" | grep -oP '\[[^\]]+\]$')
+                    [[ -z "$FILTER_LABEL" ]] && FILTER_LABEL="[1]"
 
                     if [[ -n "$SCALE_W" ]] && [[ -n "$SCALE_H" ]]; then
                         REWRITTEN_ARGS+=("-filter_complex")
-                        REWRITTEN_ARGS+=("[0:0]scale=w=${SCALE_W}:h=${SCALE_H}:force_divisible_by=4,format=nv12,hwupload[1]")
+                        REWRITTEN_ARGS+=("[0:0]format=nv12,hwupload=extra_hw_frames=64,scale_qsv=w=${SCALE_W}:h=${SCALE_H}${FILTER_LABEL}")
                         SKIP_NEXT=true
+                        CODEC_REWRITES="${CODEC_REWRITES} scale→scale_qsv:${SCALE_W}x${SCALE_H}"
                         continue
                     fi
                 fi
@@ -467,7 +512,7 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                 REWRITTEN_ARGS+=("$cur_arg")
             done
 
-            # Inject -init_hw_device if not already present (needed for hwupload → h264_vaapi)
+            # Inject -init_hw_device qsv=hw if not already present
             HAS_HW_INIT=false
             for arg in "${REWRITTEN_ARGS[@]}"; do
                 if [[ "$arg" == "-init_hw_device" ]]; then
@@ -477,19 +522,17 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
             done
 
             if [[ "$HAS_HW_INIT" == "false" ]]; then
-                # Prepend hw device init + filter device binding
                 declare -a FINAL_ARGS=()
-                FINAL_ARGS+=("-init_hw_device" "vaapi=vaapi:/dev/dri/renderD128")
-                FINAL_ARGS+=("-filter_hw_device" "vaapi")
+                FINAL_ARGS+=("-init_hw_device" "qsv=hw")
+                FINAL_ARGS+=("-filter_hw_device" "hw")
                 FINAL_ARGS+=("${REWRITTEN_ARGS[@]}")
                 REWRITTEN_ARGS=("${FINAL_ARGS[@]}")
             fi
 
             # Strip Plex-specific flags that system ffmpeg doesn't understand
-            # Plex's bundled transcoder uses musl libc which can't load system VA drivers
-            # So we use /usr/bin/ffmpeg (glibc) for VAAPI transcoding instead
             declare -a CLEAN_ARGS=()
             SKIP_NEXT_CLEAN=false
+            STRIPPED_FLAGS=""
             for i in "${!REWRITTEN_ARGS[@]}"; do
                 if [[ "$SKIP_NEXT_CLEAN" == "true" ]]; then
                     SKIP_NEXT_CLEAN=false
@@ -497,20 +540,31 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                 fi
                 ca="${REWRITTEN_ARGS[$i]}"
                 # Remove Plex-specific flags (flag + value pairs)
-                if [[ "$ca" == "-loglevel_plex" ]] || [[ "$ca" == "-progressurl" ]]; then
+                if [[ "$ca" == "-loglevel_plex" ]] || [[ "$ca" == "-progressurl" ]] || [[ "$ca" == "-time_delta" ]] || [[ "$ca" == "-delete_removed" ]] || [[ "$ca" == "-skip_to_segment" ]] || [[ "$ca" == "-manifest_name" ]]; then
                     SKIP_NEXT_CLEAN=true
+                    STRIPPED_FLAGS="${STRIPPED_FLAGS} ${ca}"
+                    continue
+                fi
+                # Strip -loglevel quiet (we inject -loglevel warning instead)
+                if [[ "$ca" == "-loglevel" ]] && [[ "${REWRITTEN_ARGS[$((i+1))]:-}" == "quiet" ]]; then
+                    SKIP_NEXT_CLEAN=true
+                    STRIPPED_FLAGS="${STRIPPED_FLAGS} -loglevel:quiet"
                     continue
                 fi
                 CLEAN_ARGS+=("$ca")
             done
 
-            LOCAL_ARGS=("${CLEAN_ARGS[@]}")
-            log_event "LOCAL" "VAAPI rewrite: libx264 → h264_vaapi + CPU scale + hwupload (system ffmpeg)"
+            # Inject -loglevel warning for better debugging
+            declare -a FINAL_CLEAN=("-loglevel" "warning")
+            FINAL_CLEAN+=("${CLEAN_ARGS[@]}")
+
+            LOCAL_ARGS=("${FINAL_CLEAN[@]}")
+            log_event "LOCAL" "QSV rewrite:${CODEC_REWRITES} | stripped:${STRIPPED_FLAGS} (system ffmpeg)"
         fi
     fi
 
-    # Use system ffmpeg for VAAPI (Plex's musl libc can't load glibc VA drivers)
-    if [[ "$VAAPI_REWRITE" == "true" ]] && [[ -x /usr/bin/ffmpeg ]]; then
+    # Use system ffmpeg for QSV (Plex's musl libc can't load glibc VA drivers)
+    if [[ "$QSV_REWRITE" == "true" ]] && [[ -x /usr/bin/ffmpeg ]]; then
         LOCAL_BINARY="/usr/bin/ffmpeg"
     else
         LOCAL_BINARY="$REAL_TRANSCODER"
@@ -524,10 +578,10 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         echo ""
         echo "Started:  $(date -Iseconds)"
         echo "Binary:   ${LOCAL_BINARY}"
-        echo "VAAPI:    ${VAAPI_REWRITE}"
+        echo "QSV:      ${QSV_REWRITE}"
     } >> "${SESSION_DIR}/00_session.log"
 
-    if [[ "$VAAPI_REWRITE" == "true" ]]; then
+    if [[ "$QSV_REWRITE" == "true" ]]; then
         {
             echo "Rewritten args:"
             local_idx=0
@@ -538,9 +592,9 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         } >> "${SESSION_DIR}/00_session.log"
     fi
 
-    if [[ "$VAAPI_REWRITE" == "true" ]]; then
+    if [[ "$QSV_REWRITE" == "true" ]]; then
         # System ffmpeg needs LIBVA_DRIVER_NAME to find the correct VA driver
-        LIBVA_DRIVER_NAME=iHD "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
+        LIBVA_DRIVER_NAME=iHD LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
     else
         "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
     fi
