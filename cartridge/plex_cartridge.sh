@@ -377,6 +377,145 @@ fi
 
 # Fall back to local transcoder if needed
 if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
+
+    # -----------------------------------------------------------------------
+    # VAAPI hardware encoding rewrite for local fallback
+    # Without Plex Pass, Plex sends libx264 (CPU encode) + CPU scale filters.
+    # This rewrites the full pipeline to use VAAPI GPU encode + GPU scaling,
+    # so users get hardware transcoding locally without Plex Pass.
+    #
+    # Rewrites:
+    #   libx264 → h264_vaapi
+    #   scale=w=W:h=H → scale_vaapi=w=W:h=H:format=nv12 (with hwupload)
+    #   Removes -crf, -preset, -x264opts (not supported by h264_vaapi)
+    #   Adds -hwaccel_output_format vaapi (keeps decoded frames on GPU)
+    #   Adds -init_hw_device + -filter_hw_device if missing
+    #   Adds -global_quality 23 for h264_vaapi quality control
+    # -----------------------------------------------------------------------
+    LOCAL_ARGS=("$@")
+    VAAPI_REWRITE=false
+
+    if [[ -e /dev/dri/renderD128 ]]; then
+        # Check if libx264 is in the args (no Plex Pass HW encoding)
+        NEEDS_REWRITE=false
+        for arg in "${LOCAL_ARGS[@]}"; do
+            if [[ "$arg" == "libx264" ]]; then
+                NEEDS_REWRITE=true
+                break
+            fi
+        done
+
+        if [[ "$NEEDS_REWRITE" == "true" ]]; then
+            VAAPI_REWRITE=true
+            declare -a REWRITTEN_ARGS=()
+            SKIP_NEXT=false
+            SCALE_W=""
+            SCALE_H=""
+
+            for i in "${!LOCAL_ARGS[@]}"; do
+                if [[ "$SKIP_NEXT" == "true" ]]; then
+                    SKIP_NEXT=false
+                    continue
+                fi
+
+                cur_arg="${LOCAL_ARGS[$i]}"
+                nxt_arg="${LOCAL_ARGS[$((i+1))]:-}"
+
+                # Replace libx264 with h264_vaapi
+                if [[ "$cur_arg" == "libx264" ]]; then
+                    REWRITTEN_ARGS+=("h264_vaapi")
+                    continue
+                fi
+
+                # Skip x264-specific options (flag + value pairs)
+                if [[ "$cur_arg" == -x264opts* ]] || [[ "$cur_arg" == -preset* ]]; then
+                    SKIP_NEXT=true
+                    continue
+                fi
+
+                # Replace -crf with -global_quality (VAAPI equivalent)
+                if [[ "$cur_arg" == -crf* ]]; then
+                    REWRITTEN_ARGS+=("-global_quality:0")
+                    REWRITTEN_ARGS+=("23")
+                    SKIP_NEXT=true
+                    continue
+                fi
+
+                # Fix broken -init_hw_device vaapi=vaapi: (no device path)
+                if [[ "$cur_arg" == "-init_hw_device" ]] && [[ "$nxt_arg" == "vaapi=vaapi:" ]]; then
+                    REWRITTEN_ARGS+=("-init_hw_device")
+                    REWRITTEN_ARGS+=("vaapi=vaapi:/dev/dri/renderD128")
+                    SKIP_NEXT=true
+                    continue
+                fi
+
+                # Rewrite video filter_complex: keep CPU scale, add hwupload for GPU encode
+                # Note: scale_vaapi requires VPP (VAEntrypointVideoProc) which some iHD
+                # drivers don't expose. CPU scale + hwupload + h264_vaapi encode is reliable.
+                if [[ "$cur_arg" == "-filter_complex" ]] && [[ "$nxt_arg" == *"scale=w="* ]] && [[ "$nxt_arg" == "[0:0]"* ]]; then
+                    SCALE_W=$(echo "$nxt_arg" | grep -oP 'scale=w=\K\d+')
+                    SCALE_H=$(echo "$nxt_arg" | grep -oP ':h=\K\d+')
+
+                    if [[ -n "$SCALE_W" ]] && [[ -n "$SCALE_H" ]]; then
+                        REWRITTEN_ARGS+=("-filter_complex")
+                        REWRITTEN_ARGS+=("[0:0]scale=w=${SCALE_W}:h=${SCALE_H}:force_divisible_by=4,format=nv12,hwupload[1]")
+                        SKIP_NEXT=true
+                        continue
+                    fi
+                fi
+
+                REWRITTEN_ARGS+=("$cur_arg")
+            done
+
+            # Inject -init_hw_device if not already present (needed for hwupload → h264_vaapi)
+            HAS_HW_INIT=false
+            for arg in "${REWRITTEN_ARGS[@]}"; do
+                if [[ "$arg" == "-init_hw_device" ]]; then
+                    HAS_HW_INIT=true
+                    break
+                fi
+            done
+
+            if [[ "$HAS_HW_INIT" == "false" ]]; then
+                # Prepend hw device init + filter device binding
+                declare -a FINAL_ARGS=()
+                FINAL_ARGS+=("-init_hw_device" "vaapi=vaapi:/dev/dri/renderD128")
+                FINAL_ARGS+=("-filter_hw_device" "vaapi")
+                FINAL_ARGS+=("${REWRITTEN_ARGS[@]}")
+                REWRITTEN_ARGS=("${FINAL_ARGS[@]}")
+            fi
+
+            # Strip Plex-specific flags that system ffmpeg doesn't understand
+            # Plex's bundled transcoder uses musl libc which can't load system VA drivers
+            # So we use /usr/bin/ffmpeg (glibc) for VAAPI transcoding instead
+            declare -a CLEAN_ARGS=()
+            SKIP_NEXT_CLEAN=false
+            for i in "${!REWRITTEN_ARGS[@]}"; do
+                if [[ "$SKIP_NEXT_CLEAN" == "true" ]]; then
+                    SKIP_NEXT_CLEAN=false
+                    continue
+                fi
+                ca="${REWRITTEN_ARGS[$i]}"
+                # Remove Plex-specific flags (flag + value pairs)
+                if [[ "$ca" == "-loglevel_plex" ]] || [[ "$ca" == "-progressurl" ]]; then
+                    SKIP_NEXT_CLEAN=true
+                    continue
+                fi
+                CLEAN_ARGS+=("$ca")
+            done
+
+            LOCAL_ARGS=("${CLEAN_ARGS[@]}")
+            log_event "LOCAL" "VAAPI rewrite: libx264 → h264_vaapi + CPU scale + hwupload (system ffmpeg)"
+        fi
+    fi
+
+    # Use system ffmpeg for VAAPI (Plex's musl libc can't load glibc VA drivers)
+    if [[ "$VAAPI_REWRITE" == "true" ]] && [[ -x /usr/bin/ffmpeg ]]; then
+        LOCAL_BINARY="/usr/bin/ffmpeg"
+    else
+        LOCAL_BINARY="$REAL_TRANSCODER"
+    fi
+
     {
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
@@ -384,10 +523,27 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         echo "═══════════════════════════════════════════════════════════════"
         echo ""
         echo "Started:  $(date -Iseconds)"
-        echo "Binary:   ${REAL_TRANSCODER}"
+        echo "Binary:   ${LOCAL_BINARY}"
+        echo "VAAPI:    ${VAAPI_REWRITE}"
     } >> "${SESSION_DIR}/00_session.log"
 
-    "$REAL_TRANSCODER" "$@" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
+    if [[ "$VAAPI_REWRITE" == "true" ]]; then
+        {
+            echo "Rewritten args:"
+            local_idx=0
+            for arg in "${LOCAL_ARGS[@]}"; do
+                printf "  argv[%3d] = %s\n" "$local_idx" "$arg"
+                local_idx=$((local_idx + 1))
+            done
+        } >> "${SESSION_DIR}/00_session.log"
+    fi
+
+    if [[ "$VAAPI_REWRITE" == "true" ]]; then
+        # System ffmpeg needs LIBVA_DRIVER_NAME to find the correct VA driver
+        LIBVA_DRIVER_NAME=iHD "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
+    else
+        "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
+    fi
     EXIT_CODE=$?
 
     {
