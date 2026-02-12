@@ -25,10 +25,13 @@ A modern revival of the legendary [plex-remote-transcoder](https://github.com/wn
 - **HTTP API** instead of SSH tunnels
 - **Streaming transcode** -- pipes output directly back, no shared filesystem required
 - **Self-healing cartridge** -- survives Plex updates automatically via watchdog daemon
-- **Hardware acceleration** -- Intel QSV, NVIDIA NVENC, VAAPI
+- **Hardware acceleration** -- Intel QSV, NVIDIA NVENC, VAAPI with full GPU pipeline (HW decode + GPU scale + HW encode)
+- **Blazing fast** -- 4K HEVC → 1080p H.264 at **11x realtime** (267 FPS) on Intel Iris Xe via QSV
+- **Smart filter conversion** -- automatically converts Jellyfin's software video filters to GPU equivalents (`scale` → `scale_qsv`/`scale_cuda`)
 - **Docker or bare-metal** -- run in Docker with the cartridge pre-installed, or install on bare metal
 - **Cross-platform worker** -- runs on Windows or Linux
 - **Automatic fallback** -- gracefully falls back to local transcoding if the worker is down
+- **Orphan job reaper** -- detects and kills stale ffmpeg processes when clients disconnect
 
 ## How It Works
 
@@ -139,7 +142,9 @@ curl http://localhost:8765/jobs      # Shows active transcode jobs
 │              GPU WORKER (Windows/Linux, Docker or bare-metal)     │
 │                                                                   │
 │  FastAPI service + FFmpeg with hardware acceleration              │
-│  Routes: Plex args get filtered, Jellyfin args pass through      │
+│  * Plex args: strips quirks, replaces encoder, injects hwaccel   │
+│  * Jellyfin args: converts SW filters to GPU, injects hwaccel    │
+│  * Orphan reaper kills stale jobs on client disconnect            │
 │  Intel QSV | NVIDIA NVENC | VAAPI                                 │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -220,6 +225,10 @@ PLEX_WORKER_API_KEY=your-secret    # optional auth
 # Media path mapping (when Plex runs in Docker, worker runs bare-metal)
 PLEX_WORKER_MEDIA_PATH_FROM=/media
 PLEX_WORKER_MEDIA_PATH_TO=C:/Users/you/media
+
+# Multiple path mappings for Plex + Jellyfin on the same worker
+# Semicolon-delimited from=to pairs (longest prefix wins)
+PLEX_WORKER_PATH_MAPPINGS=/config/Library=C:/path/to/plex/Library;/config/cache=C:/path/to/jellyfin/cache;/config/data=C:/path/to/jellyfin/data
 ```
 
 ### Docker `.env` (project root)
@@ -278,16 +287,31 @@ curl http://localhost:8765/health          # Health check
 curl http://localhost:8765/jobs            # List active jobs
 ```
 
+## Performance
+
+Full GPU pipeline: hardware decode + GPU scaling + hardware encode.
+
+| Source | Content | GPU | Speed | Notes |
+|--------|---------|-----|-------|-------|
+| Plex | 4K HEVC → 1080p H.264 | Intel Iris Xe (QSV) | **11x** (267 FPS) | VDBOX fixed-function encode |
+| Jellyfin | 4K HEVC → 1080p H.264 | Intel Iris Xe (QSV) | **8-17x** | SW filter auto-converted to `scale_qsv` |
+| Plex | 4K HEVC → 1080p H.264 | NVIDIA (NVENC) | TBD | P1 preset, ultra-low latency tune |
+
+Key speed flags applied automatically:
+- **QSV**: `-low_power 1` (VDBOX), `-async_depth 1`, `-preset veryfast`, `-global_quality 25`
+- **NVENC**: `-preset p1`, `-tune ull`, `-cq 25`
+- **All**: Hardware decode (`-hwaccel qsv/cuda`) with `-hwaccel_output_format` for zero-copy pipeline
+
 ## Supported Hardware
 
 | GPU | Encoder | Platform | Notes |
 |-----|---------|----------|-------|
 | Intel QSV (6th gen+) | h264_qsv, hevc_qsv | Windows/Linux | Bare-metal on Windows, Docker on Linux |
 | NVIDIA GTX 900+ | h264_nvenc, hevc_nvenc | Windows/Linux | 3-5 concurrent streams (consumer) |
-| NVIDIA RTX/Quadro | h264_nvenc, hevc_nvenc | Windows/Linux | Unlimited streams |
+| NVIDIA RTX/Quadro/Tesla | h264_nvenc, hevc_nvenc | Windows/Linux | Unlimited streams |
 | AMD/Intel VAAPI | h264_vaapi | Linux only | Docker or bare-metal |
 
-> **Windows note:** Intel QSV works great bare-metal on Windows (software decode + QSV encode). Intel GPU Docker workers do not work on Windows due to WSL2 lacking i915/KMS drivers.
+> **Windows note:** Intel QSV works great bare-metal on Windows with full HW decode+encode pipeline. Intel GPU Docker workers do not work on Windows due to WSL2 lacking i915/KMS drivers.
 
 ## Project Structure
 
