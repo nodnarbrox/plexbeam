@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -66,6 +67,8 @@ class JobStatus(BaseModel):
     progress: float = 0.0
     fps: float = 0.0
     speed: float = 0.0
+    frame: int = 0
+    out_time_ms: int = 0  # microseconds despite the name (ffmpeg quirk)
     current_segment: Optional[int] = None
     eta_seconds: Optional[int] = None
     error: Optional[str] = None
@@ -95,16 +98,21 @@ class JobQueue:
         self.active_jobs: set[str] = set()
         self.workers: list[asyncio.Task] = []
         self.websocket_connections: dict[str, list[WebSocket]] = {}
+        self.last_polled: dict[str, float] = {}  # job_id -> timestamp
+        self._reaper_task: Optional[asyncio.Task] = None
 
     async def start_workers(self):
         """Start background worker tasks."""
         for i in range(settings.max_concurrent_jobs):
             task = asyncio.create_task(self._worker(i))
             self.workers.append(task)
+        self._reaper_task = asyncio.create_task(self._orphan_reaper())
         logger.info(f"Started {settings.max_concurrent_jobs} worker(s)")
 
     async def stop_workers(self):
         """Stop all worker tasks."""
+        if self._reaper_task:
+            self._reaper_task.cancel()
         for task in self.workers:
             task.cancel()
         await asyncio.gather(*self.workers, return_exceptions=True)
@@ -145,6 +153,30 @@ class JobQueue:
 
             except asyncio.CancelledError:
                 break
+
+    async def _orphan_reaper(self):
+        """Cancel running jobs that haven't been polled for 30+ seconds.
+        Handles the case where Jellyfin/Plex kills the cartridge (SIGKILL)
+        without sending a cancel request to the worker."""
+        while True:
+            try:
+                await asyncio.sleep(15)
+                now = time.time()
+                for job_id in list(self.active_jobs):
+                    last = self.last_polled.get(job_id)
+                    if last is not None and (now - last) > 30:
+                        logger.info(f"Orphan reaper: cancelling stale job {job_id} "
+                                    f"(no poll for {now - last:.0f}s)")
+                        await self.cancel_job(job_id)
+                        self.last_polled.pop(job_id, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Orphan reaper error: {e}")
+
+    def record_poll(self, job_id: str):
+        """Record that a client polled for this job's status."""
+        self.last_polled[job_id] = time.time()
 
     def _broadcast_progress(self, progress: TranscodeProgress):
         """Broadcast progress to connected WebSocket clients."""
@@ -403,12 +435,18 @@ async def get_job_status(job_id: str, x_api_key: Optional[str] = Header(None)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # Track poll time for orphan detection
+    if job.progress.status in ("running", "queued"):
+        job_queue.record_poll(job_id)
+
     return JobStatus(
         job_id=job.job_id,
         status=job.progress.status,
         progress=job.progress.progress,
         fps=job.progress.fps,
         speed=job.progress.speed,
+        frame=job.progress.frame,
+        out_time_ms=job.progress.out_time_ms,
         current_segment=job.progress.current_segment,
         error=job.progress.error,
         started_at=job.started_at,
@@ -538,6 +576,7 @@ def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
     skip_next = False
     skip_f_format = False
     skip_filter_complex = False
+    seen_input = False
     for i, arg in enumerate(raw_args):
         if skip_next:
             skip_next = False
@@ -547,6 +586,13 @@ def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
             continue
         if skip_filter_complex:
             skip_filter_complex = False
+            continue
+        if arg == "-i":
+            seen_input = True
+        # Strip input decoder specs before -i when hwaccel is enabled
+        # -codec:0 hevc forces CPU decoder, blocking QSV/CUDA auto-selection
+        if not seen_input and settings.hw_accel != "none" and re.match(r'-codec:\d+$', arg):
+            skip_next = True
             continue
         if arg in plex_opts_with_value:
             skip_next = True
@@ -567,15 +613,27 @@ def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
         if is_hevc_input and has_video_copy and arg == "-codec:0" and i + 1 < len(raw_args) and raw_args[i + 1] == "copy":
             hw_encoder = settings.get_video_encoder()
             hw_accel = settings.hw_accel
-            # Downscale to 1080p max (community preference: don't transcode at 4K)
-            scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            # Downscale to 1080p max with per-accelerator GPU scale
+            if hw_accel == "vaapi":
+                scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2"
+            elif hw_accel == "qsv":
+                scale_filter = "scale_qsv=w=1920:h=-1:format=nv12"
+            elif hw_accel == "nvenc":
+                scale_filter = "scale_cuda=1920:-1:format=nv12"
+            else:
+                scale_filter = "scale=1920:-2"
             encoder_opts = ["-c:v", hw_encoder]
             if hw_accel == "vaapi":
                 encoder_opts.extend(["-qp", "26"])
+            elif hw_accel == "qsv":
+                encoder_opts.extend([
+                    "-preset", "veryfast", "-global_quality", "26",
+                    "-low_power", "1", "-async_depth", "1",
+                ])
+            elif hw_accel == "nvenc":
+                encoder_opts.extend(["-preset", "p1", "-tune", "ull", "-cq", "26"])
             elif hw_accel == "none":
                 encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
-            else:
-                encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
             filtered_args.extend([
                 "-vf", scale_filter,
                 *encoder_opts,
@@ -588,14 +646,27 @@ def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
         if needs_video_transcode and arg == "-codec:0" and i + 1 < len(raw_args) and raw_args[i + 1] == "libx264":
             hw_encoder = settings.get_video_encoder()
             hw_accel = settings.hw_accel
-            scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+            # Downscale to 1080p max with per-accelerator GPU scale
+            if hw_accel == "vaapi":
+                scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2"
+            elif hw_accel == "qsv":
+                scale_filter = "scale_qsv=w=1920:h=-1:format=nv12"
+            elif hw_accel == "nvenc":
+                scale_filter = "scale_cuda=1920:-1:format=nv12"
+            else:
+                scale_filter = "scale=1920:-2"
             encoder_opts = ["-c:v", hw_encoder]
             if hw_accel == "vaapi":
                 encoder_opts.extend(["-qp", "26"])
+            elif hw_accel == "qsv":
+                encoder_opts.extend([
+                    "-preset", "veryfast", "-global_quality", "26",
+                    "-low_power", "1", "-async_depth", "1",
+                ])
+            elif hw_accel == "nvenc":
+                encoder_opts.extend(["-preset", "p1", "-tune", "ull", "-cq", "26"])
             elif hw_accel == "none":
                 encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
-            else:
-                encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
             filtered_args.extend([
                 "-vf", scale_filter,
                 *encoder_opts,
@@ -642,22 +713,51 @@ def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
                     arg = arg.replace("ochl=", "ocl=")
             except Exception:
                 pass
+        # Replace HLS VOD mode with event mode (Windows m3u8 flush issue)
+        if arg == "vod" and i > 0 and raw_args[i - 1] == "-hls_playlist_type":
+            arg = "event"
         # Apply media path mapping for bare-metal workers
         if settings.media_path_from and settings.media_path_to:
             if arg.startswith(settings.media_path_from):
                 arg = settings.media_path_to + arg[len(settings.media_path_from):]
         filtered_args.append(arg)
 
-    # Inject VAAPI hardware acceleration args before -i
-    # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM/WSL2 KMS limitation
+    # Inject hardware acceleration args before -i for all hw_accel types
+    # HW decode is the #1 speed win — 4K HEVC decode on CPU is the bottleneck
     needs_hw_encode = is_hevc_input or needs_video_transcode
-    if settings.hw_accel == "vaapi" and needs_hw_encode:
-        device = settings.qsv_device or "/dev/dri/renderD128"
-        vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
+    if needs_hw_encode and settings.hw_accel != "none":
+        hw_accel = settings.hw_accel
+        # Check for SW vs HW video filters
+        hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload")
+        has_sw_vf = False
         for idx, a in enumerate(filtered_args):
-            if a == "-i":
-                filtered_args[idx:idx] = vaapi_init
-                break
+            if a == "-vf" and idx + 1 < len(filtered_args):
+                if not any(kw in filtered_args[idx + 1] for kw in hw_filter_keywords):
+                    has_sw_vf = True
+                    break
+
+        hwaccel_args = []
+        if hw_accel == "qsv":
+            hwaccel_args = ["-hwaccel", "qsv"]
+            if settings.qsv_device:
+                hwaccel_args.extend(["-qsv_device", settings.qsv_device])
+            if not has_sw_vf:
+                hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
+            hwaccel_args.extend(["-extra_hw_frames", "8"])
+        elif hw_accel == "nvenc":
+            hwaccel_args = ["-hwaccel", "cuda"]
+            if not has_sw_vf:
+                hwaccel_args.extend(["-hwaccel_output_format", "cuda"])
+        elif hw_accel == "vaapi":
+            # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM/WSL2 KMS limitation
+            device = settings.qsv_device or "/dev/dri/renderD128"
+            hwaccel_args = ["-hwaccel", "vaapi", "-vaapi_device", device]
+
+        if hwaccel_args:
+            for idx, a in enumerate(filtered_args):
+                if a == "-i":
+                    filtered_args[idx:idx] = hwaccel_args
+                    break
 
     return filtered_args
 

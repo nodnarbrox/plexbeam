@@ -68,6 +68,70 @@ class TranscodeJob:
         self.progress = TranscodeProgress(self.job_id)
 
 
+def _split_scale_args(body: str) -> list[str]:
+    """Split scale filter args on ':' respecting parentheses nesting."""
+    parts, current, depth = [], [], 0
+    for ch in body:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == ':' and depth == 0:
+            parts.append(''.join(current))
+            current = []
+            continue
+        current.append(ch)
+    parts.append(''.join(current))
+    return parts
+
+
+def _convert_vf_to_gpu(vf_value: str, hw_accel: str) -> str | None:
+    """Try to convert a software -vf filter chain to GPU equivalent.
+
+    Returns the GPU filter string, or None if conversion isn't possible.
+    Handles Jellyfin-style filters like:
+      setparams=...,scale=trunc(...):trunc(...),format=yuv420p
+    """
+    # Bail out if subtitle burn-in present (CPU-only)
+    if any(kw in vf_value for kw in ("subtitles=", "ass=", "overlay")):
+        return None
+
+    # Split on unescaped commas (Jellyfin uses \, for literal commas in expressions)
+    filters = re.split(r'(?<!\\),', vf_value)
+    scale_expr_w = None
+    scale_expr_h = None
+
+    for f in filters:
+        f = f.strip()
+        if f.startswith("scale="):
+            scale_body = f[len("scale="):]
+            parts = _split_scale_args(scale_body)
+            if len(parts) >= 2:
+                scale_expr_w = parts[0]
+                scale_expr_h = parts[1]
+            elif len(parts) == 1:
+                scale_expr_w = parts[0]
+                scale_expr_h = "-1"
+        elif f.startswith("format=") or f.startswith("setparams="):
+            continue  # Drop — absorbed by GPU scale or metadata-only
+        else:
+            return None  # Unknown filter, can't convert
+
+    if scale_expr_w is None:
+        return None  # No scale found, nothing to convert
+
+    if hw_accel == "qsv":
+        # scale_qsv doesn't support h=-2, use -1
+        h = "-1" if scale_expr_h == "-2" else scale_expr_h
+        return f"scale_qsv=w={scale_expr_w}:h={h}:format=nv12"
+    elif hw_accel == "nvenc":
+        h = "-1" if scale_expr_h == "-2" else scale_expr_h
+        return f"scale_cuda={scale_expr_w}:{h}:format=nv12"
+    elif hw_accel == "vaapi":
+        return f"format=nv12,hwupload,scale_vaapi=w={scale_expr_w}:h={scale_expr_h}"
+    return None
+
+
 class FFmpegTranscoder:
     """Executes FFmpeg transcodes with hardware acceleration."""
 
@@ -411,6 +475,9 @@ class FFmpegTranscoder:
                 arg = arg[6:-1]
             elif arg.startswith("file:"):
                 arg = arg[5:]
+            # Replace HLS VOD mode with event mode (Windows m3u8 flush issue)
+            if arg == "vod" and i > 0 and raw_args[i - 1] == "-hls_playlist_type":
+                arg = "event"
             # Apply all path mappings (longest prefix first)
             for frm, to in path_mappings:
                 if arg.startswith(frm):
@@ -490,6 +557,14 @@ class FFmpegTranscoder:
             elif arg.startswith("file:"):
                 arg = arg[5:]
 
+            # Convert Jellyfin's SW video filters to GPU equivalents
+            if arg == "-vf" and i + 1 < len(raw_args) and needs_hw_replace:
+                gpu_vf = _convert_vf_to_gpu(raw_args[i + 1], hw_accel)
+                if gpu_vf is not None:
+                    filtered_args.extend(["-vf", gpu_vf])
+                    skip_next = True
+                    continue
+
             # Replace software encoder with HW encoder + inject speed flags
             if needs_hw_replace and arg in ("-codec:v:0", "-codec:0", "-c:v", "-c:v:0", "-vcodec"):
                 next_arg = raw_args[i + 1] if i + 1 < len(raw_args) else ""
@@ -507,6 +582,14 @@ class FFmpegTranscoder:
 
             # Strip x264opts (incompatible with HW encoders)
             if hw_accel != "none" and arg.startswith("-x264opts"):
+                skip_next = True
+                continue
+
+            # Strip -maxrate/-bufsize for HW quality-based encoding.
+            # Jellyfin sends very low maxrate (e.g. 292kbps) which is fine for
+            # libx264 CRF (soft cap) but switches QSV/NVENC from quality mode
+            # (ICQ/CQ) to VBR, severely limiting output quality.
+            if needs_hw_replace and arg in ("-maxrate", "-bufsize"):
                 skip_next = True
                 continue
 
@@ -529,6 +612,12 @@ class FFmpegTranscoder:
             # Replace libfdk_aac with built-in aac (not all ffmpeg builds have libfdk)
             if arg == "libfdk_aac":
                 arg = "aac"
+
+            # Replace HLS VOD mode with event mode — on Windows, VOD mode defers
+            # m3u8 writing until ffmpeg exits, so killed jobs produce no playlist.
+            # Event mode writes the m3u8 progressively as segments are produced.
+            if arg == "vod" and i > 0 and raw_args[i - 1] == "-hls_playlist_type":
+                arg = "event"
 
             # Apply all path mappings (longest prefix first)
             for frm, to in path_mappings:

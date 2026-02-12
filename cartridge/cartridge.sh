@@ -41,6 +41,15 @@ SHARED_SEGMENT_DIR="__SHARED_SEGMENT_DIR__"  # Where worker writes segments
 # --- Runtime vars ------------------------------------------------------------
 SESSION_ID="$(date +%Y%m%d_%H%M%S)_$$"
 SESSION_DIR="${LOG_BASE}/sessions/${SESSION_ID}"
+DISPATCHED_TO_REMOTE=false
+
+# --- Cleanup trap: cancel worker job when cartridge is killed ----------------
+_cleanup_remote() {
+    if [[ "$DISPATCHED_TO_REMOTE" == "true" ]] && [[ -n "${REMOTE_WORKER_URL:-}" ]]; then
+        curl -sf -X DELETE "${REMOTE_WORKER_URL}/job/${SESSION_ID}" &>/dev/null || true
+    fi
+}
+trap _cleanup_remote EXIT
 
 # --- Logging helper ----------------------------------------------------------
 log_event() {
@@ -292,6 +301,7 @@ JOBEOF
     job_status=$(echo "$response" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "")
 
     if [[ "$job_status" == "queued" ]] || [[ "$job_status" == "running" ]]; then
+        DISPATCHED_TO_REMOTE=true
         log_event "REMOTE" "Job ${SESSION_ID} submitted successfully (status: ${job_status})"
 
         # Poll for completion
@@ -312,6 +322,8 @@ JOBEOF
                     completed)
                         log_event "REMOTE" "Job ${SESSION_ID} completed successfully"
                         echo "$status_response" > "${SESSION_DIR}/03_job_completed.json"
+                        # Final progress line so media server knows encoding finished
+                        printf "frame=9999 fps=0.0 q=-1.0 size=N/A time=99:99:99.99 bitrate=N/A speed=0.0x\n" >&2
                         return 0
                         ;;
                     failed)
@@ -324,6 +336,26 @@ JOBEOF
                     cancelled)
                         log_event "REMOTE" "Job ${SESSION_ID} was cancelled"
                         return 1
+                        ;;
+                    running)
+                        # Emit ffmpeg-compatible progress on stderr so Jellyfin/Plex
+                        # TranscodeManager knows segments are ready to serve.
+                        local p_fps="" p_speed="" p_otms="" p_frame=""
+                        p_fps=$(echo "$status_response" | grep -o '"fps":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
+                        p_speed=$(echo "$status_response" | grep -o '"speed":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
+                        p_otms=$(echo "$status_response" | grep -o '"out_time_ms":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
+                        p_frame=$(echo "$status_response" | grep -o '"frame":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
+                        : "${p_fps:=0}" "${p_speed:=0}" "${p_otms:=0}" "${p_frame:=0}"
+
+                        # Convert out_time_ms (microseconds despite name) to HH:MM:SS.ff
+                        local ts=$((p_otms / 1000000))
+                        local time_str
+                        time_str=$(printf "%02d:%02d:%02d.%02d" \
+                            $((ts / 3600)) $(( (ts % 3600) / 60 )) $((ts % 60)) \
+                            $(( (p_otms % 1000000) / 10000 )) )
+
+                        printf "frame=%s fps=%s q=-1.0 size=N/A time=%s bitrate=N/A speed=%sx\n" \
+                            "$p_frame" "$p_fps" "$time_str" "$p_speed" >&2
                         ;;
                 esac
 
