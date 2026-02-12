@@ -49,6 +49,7 @@ class TranscodeRequest(BaseModel):
     timeout: int = Field(default=3600)
     callback_url: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
+    source: str = Field(default="plex", description="Source server type (plex or jellyfin)")
 
 
 class TranscodeResponse(BaseModel):
@@ -285,6 +286,17 @@ async def create_transcode_job(
     else:
         input_path = input_spec.get("path") or input_spec.get("url", "")
 
+    # Strip Jellyfin's file: protocol prefix (e.g., file:/media/foo -> /media/foo)
+    if input_path.startswith('file:"') and input_path.endswith('"'):
+        input_path = input_path[6:-1]
+    elif input_path.startswith("file:"):
+        input_path = input_path[5:]
+
+    # Apply media path mapping for build_ffmpeg_command path (raw passthrough does its own)
+    if settings.media_path_from and settings.media_path_to:
+        if input_path.startswith(settings.media_path_from):
+            input_path = settings.media_path_to + input_path[len(settings.media_path_from):]
+
     if not input_path:
         raise HTTPException(status_code=400, detail="No input path or URL provided")
 
@@ -315,6 +327,8 @@ async def create_transcode_job(
 
     # Build job from request
     args = request.arguments
+    source = request.source
+    logger.info(f"[{request.job_id}] Source: {source}, input_path: {input_path}")
     job = TranscodeJob(
         job_id=request.job_id,
         input_path=input_path,
@@ -335,7 +349,8 @@ async def create_transcode_job(
         tone_mapping=args.get("tone_mapping", False),
         output_type=output_type,
         segment_duration=output_spec.get("segment_duration", 4),
-        raw_args=args.get("raw_args", [])
+        raw_args=args.get("raw_args", []),
+        source=source
     )
 
     # Submit to queue
@@ -466,32 +481,21 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
 
 
 # ============================================================================
-# Streaming Transcode Endpoint
+# Streaming Transcode Helpers
 # ============================================================================
 
-@app.post("/transcode/stream")
-async def stream_transcode(request: Request):
+def _filter_plex_stream_args(raw_args: list[str]) -> list[str]:
     """
-    Stream transcode output directly back to the client.
-    The worker does GPU encoding and streams the result.
-    Client receives raw video/audio stream to write locally.
+    Filter Plex-specific args for the streaming transcode endpoint.
+
+    Handles all Plex-specific option stripping, HEVC->H.264 transcoding,
+    HW encoder replacement, filter_complex skipping, map fixing,
+    x264opts/preset:0 stripping, aac_lc->aac, ochl rewrite, VAAPI injection,
+    and media path mapping.
     """
-    body = await request.json()
-    input_path = body.get("input_path", "")
-    output_format = body.get("format", "mpegts")  # mpegts for streaming
-    raw_args = body.get("raw_args", [])
+    import re
+    import subprocess as _sp
 
-    if not input_path:
-        raise HTTPException(status_code=400, detail="No input_path provided")
-
-    # Build FFmpeg command for streaming output with low-latency settings
-    cmd = [settings.ffmpeg_path, "-y", "-nostdin",
-           "-fflags", "+nobuffer+flush_packets",  # Reduce input buffering latency
-           "-flags", "low_delay",
-           "-probesize", "32768",  # Smaller probe for faster start
-           "-analyzeduration", "500000"]  # 0.5 second analyze
-
-    # Filter Plex-specific args and output format args
     plex_opts_with_value = {
         "-loglevel_plex", "-progressurl", "-loglevel",
         "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
@@ -521,7 +525,6 @@ async def stream_transcode(request: Request):
     # Track if we skip a video filter_complex so we can fix map references
     skipped_video_filter = False
     video_filter_output_label = None
-    import re
     for i, arg in enumerate(raw_args):
         if arg == "-filter_complex" and i + 1 < len(raw_args):
             fc = raw_args[i + 1]
@@ -632,7 +635,6 @@ async def stream_transcode(request: Request):
             continue
         # Rewrite Plex 'ochl' for old ffmpeg (<5.0) that only knows 'ocl'.
         if "ochl=" in arg:
-            import subprocess as _sp
             try:
                 ver = _sp.check_output([settings.ffmpeg_path, "-version"], stderr=_sp.DEVNULL).decode()
                 major = int(ver.split("version ")[1].split(".")[0])
@@ -656,6 +658,80 @@ async def stream_transcode(request: Request):
             if a == "-i":
                 filtered_args[idx:idx] = vaapi_init
                 break
+
+    return filtered_args
+
+
+def _filter_standard_stream_args(raw_args: list[str], output_format: str) -> list[str]:
+    """
+    Minimal filtering for standard ffmpeg args in streaming mode (e.g., Jellyfin).
+
+    Jellyfin sends standard ffmpeg args. Only applies media path mapping and
+    strips output format/path args (since we pipe to stdout).
+    """
+    filtered_args = []
+    skip_next = False
+    for i, arg in enumerate(raw_args):
+        if skip_next:
+            skip_next = False
+            continue
+        # Skip -f dash/hls (we'll add our own -f mpegts/etc)
+        if arg == "-f" and i + 1 < len(raw_args) and raw_args[i + 1] in ("dash", "hls"):
+            skip_next = True
+            continue
+        # Skip standalone output format at end
+        if arg in ("dash", "hls") or arg.endswith(".mpd") or arg.endswith(".m3u8"):
+            continue
+        # Strip Jellyfin's file: protocol prefix (e.g., file:"/media/foo" -> /media/foo)
+        if arg.startswith('file:"') and arg.endswith('"'):
+            arg = arg[6:-1]  # strip file:" and trailing "
+        elif arg.startswith("file:"):
+            arg = arg[5:]
+        # Apply media path mapping for bare-metal workers
+        if settings.media_path_from and settings.media_path_to:
+            if arg.startswith(settings.media_path_from):
+                arg = settings.media_path_to + arg[len(settings.media_path_from):]
+        filtered_args.append(arg)
+    return filtered_args
+
+
+# ============================================================================
+# Streaming Transcode Endpoint
+# ============================================================================
+
+@app.post("/transcode/stream")
+async def stream_transcode(request: Request):
+    """
+    Stream transcode output directly back to the client.
+    The worker does GPU encoding and streams the result.
+    Client receives raw video/audio stream to write locally.
+    """
+    body = await request.json()
+    input_path = body.get("input_path", "")
+    output_format = body.get("format", "mpegts")  # mpegts for streaming
+    raw_args = body.get("raw_args", [])
+    source = body.get("source", "plex")
+
+    # Strip Jellyfin's file: protocol prefix
+    if input_path.startswith('file:"') and input_path.endswith('"'):
+        input_path = input_path[6:-1]
+    elif input_path.startswith("file:"):
+        input_path = input_path[5:]
+
+    if not input_path:
+        raise HTTPException(status_code=400, detail="No input_path provided")
+
+    # Build FFmpeg command for streaming output with low-latency settings
+    cmd = [settings.ffmpeg_path, "-y", "-nostdin",
+           "-fflags", "+nobuffer+flush_packets",  # Reduce input buffering latency
+           "-flags", "low_delay",
+           "-probesize", "32768",  # Smaller probe for faster start
+           "-analyzeduration", "500000"]  # 0.5 second analyze
+
+    if source == "plex":
+        filtered_args = _filter_plex_stream_args(raw_args)
+    else:
+        filtered_args = _filter_standard_stream_args(raw_args, output_format)
 
     cmd.extend(filtered_args)
 

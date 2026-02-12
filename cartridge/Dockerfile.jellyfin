@@ -1,0 +1,45 @@
+# PlexBeam Jellyfin + Cartridge — Docker Image
+# Based on linuxserver/jellyfin with the cartridge pre-installed.
+# The cartridge intercepts transcode requests and dispatches them
+# to a remote GPU worker via HTTP API.
+#
+# Build:  docker build -t plexbeam-jellyfin -f Dockerfile.jellyfin ./cartridge
+# Run:    docker run -e PLEXBEAM_WORKER_URL=http://worker:8765 ... plexbeam-jellyfin
+
+FROM lscr.io/linuxserver/jellyfin:latest
+
+LABEL maintainer="PlexBeam"
+LABEL description="Jellyfin Media Server with PlexBeam cartridge for remote GPU transcoding"
+
+# Install dependencies:
+#   jq   - needed by cartridge for JSON serialization in raw_args
+#   file - needed by init to detect binary types
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy cartridge scripts to permanent home
+COPY cartridge.sh install.sh uninstall.sh \
+     /opt/plexbeam/
+
+# Preserve pristine template (before any baking)
+RUN cp /opt/plexbeam/cartridge.sh /opt/plexbeam/cartridge.sh.orig
+
+# Make all scripts executable
+RUN chmod +x /opt/plexbeam/*.sh
+
+# Install init script (runs before Jellyfin starts)
+COPY docker-init-jellyfin.sh /custom-cont-init.d/50-plexbeam-cartridge
+RUN chmod +x /custom-cont-init.d/50-plexbeam-cartridge
+
+# No watchdog needed — Jellyfin doesn't overwrite the ffmpeg binary
+
+# Create log directory structure
+RUN mkdir -p /var/log/plexbeam/sessions
+
+# PlexBeam environment variables (override at runtime)
+ENV PLEXBEAM_WORKER_URL="" \
+    PLEXBEAM_API_KEY="" \
+    PLEXBEAM_SHARED_SEGMENT_DIR="" \
+    PLEXBEAM_UPDATE_REPO="local"

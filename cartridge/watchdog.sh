@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PLEX CARTRIDGE — Watchdog Daemon
+# PLEXBEAM CARTRIDGE — Watchdog Daemon (Plex only)
 # ============================================================================
 # Monitors the Plex transcoder binary. When Plex updates overwrite the
 # cartridge, the watchdog detects it and re-installs automatically.
@@ -135,7 +135,7 @@ check_cartridge_installed() {
     fi
     
     # Check if it contains our signature
-    if grep -q "PLEX CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
+    if grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
         return 0  # Cartridge is in place
     else
         log "ALERT" "Transcoder exists but isn't our cartridge"
@@ -172,7 +172,7 @@ reinstall_cartridge() {
     fi
     
     # Install the cartridge
-    local CARTRIDGE_SRC="${CARTRIDGE_HOME}/plex_cartridge.sh"
+    local CARTRIDGE_SRC="${CARTRIDGE_HOME}/cartridge.sh"
     if [[ ! -f "$CARTRIDGE_SRC" ]]; then
         log "ERROR" "Cartridge source not found at: ${CARTRIDGE_SRC}"
         return 1
@@ -189,7 +189,7 @@ reinstall_cartridge() {
     chown "${PLEX_USER:-plex}:${PLEX_USER:-plex}" "$TRANSCODER_PATH" 2>/dev/null || true
     
     # Verify
-    if grep -q "PLEX CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
+    if grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
         log "INFO" "Cartridge re-installed successfully"
         echo "$(date -Iseconds) | REINSTALL | success | Plex binary backed up and cartridge restored" >> "$EVENTS_LOG"
         return 0
@@ -222,7 +222,7 @@ check_for_updates() {
             local RESPONSE=$(curl -sf --connect-timeout 10 "$REMOTE_VERSION_URL" 2>/dev/null || echo "")
             if [[ -n "$RESPONSE" ]]; then
                 local REMOTE_VERSION=$(echo "$RESPONSE" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || echo "")
-                local LOCAL_VERSION=$(grep "^CARTRIDGE_VERSION=" "${CARTRIDGE_HOME}/plex_cartridge.sh" 2>/dev/null | cut -d'"' -f2 || echo "0.0.0")
+                local LOCAL_VERSION=$(grep "^CARTRIDGE_VERSION=" "${CARTRIDGE_HOME}/cartridge.sh" 2>/dev/null | cut -d'"' -f2 || echo "0.0.0")
                 
                 if [[ -n "$REMOTE_VERSION" ]] && [[ "$REMOTE_VERSION" != "$LOCAL_VERSION" ]]; then
                     log "UPDATE" "New version available: ${LOCAL_VERSION} → ${REMOTE_VERSION}"
@@ -234,12 +234,12 @@ check_for_updates() {
                         local TMP_DIR=$(mktemp -d)
                         if curl -sfL --connect-timeout 30 "$DOWNLOAD_URL" | tar xz -C "$TMP_DIR" --strip-components=1 2>/dev/null; then
                             # Validate the download has our expected files
-                            if [[ -f "${TMP_DIR}/plex_cartridge.sh" ]] && grep -q "PLEX CARTRIDGE" "${TMP_DIR}/plex_cartridge.sh"; then
+                            if [[ -f "${TMP_DIR}/cartridge.sh" ]] && grep -q "PLEXBEAM CARTRIDGE" "${TMP_DIR}/cartridge.sh"; then
                                 # Back up current version
                                 cp -r "${CARTRIDGE_HOME}" "${CARTRIDGE_HOME}.backup.$(date +%Y%m%d)" 2>/dev/null || true
                                 
                                 # Copy new files (preserve install meta)
-                                for f in plex_cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
+                                for f in cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
                                     if [[ -f "${TMP_DIR}/${f}" ]]; then
                                         cp "${TMP_DIR}/${f}" "${CARTRIDGE_HOME}/${f}"
                                         chmod +x "${CARTRIDGE_HOME}/${f}"
@@ -270,13 +270,13 @@ check_for_updates() {
         fi
     elif [[ -d "$UPDATE_REPO" ]]; then
         # Local directory — just copy if newer
-        if [[ -f "${UPDATE_REPO}/plex_cartridge.sh" ]]; then
-            local REMOTE_VERSION=$(grep "^CARTRIDGE_VERSION=" "${UPDATE_REPO}/plex_cartridge.sh" | cut -d'"' -f2 || echo "0.0.0")
-            local LOCAL_VERSION=$(grep "^CARTRIDGE_VERSION=" "${CARTRIDGE_HOME}/plex_cartridge.sh" | cut -d'"' -f2 || echo "0.0.0")
+        if [[ -f "${UPDATE_REPO}/cartridge.sh" ]]; then
+            local REMOTE_VERSION=$(grep "^CARTRIDGE_VERSION=" "${UPDATE_REPO}/cartridge.sh" | cut -d'"' -f2 || echo "0.0.0")
+            local LOCAL_VERSION=$(grep "^CARTRIDGE_VERSION=" "${CARTRIDGE_HOME}/cartridge.sh" | cut -d'"' -f2 || echo "0.0.0")
             
             if [[ "$REMOTE_VERSION" != "$LOCAL_VERSION" ]]; then
                 log "UPDATE" "Local update: ${LOCAL_VERSION} → ${REMOTE_VERSION}"
-                for f in plex_cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
+                for f in cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
                     [[ -f "${UPDATE_REPO}/${f}" ]] && cp "${UPDATE_REPO}/${f}" "${CARTRIDGE_HOME}/${f}" && chmod +x "${CARTRIDGE_HOME}/${f}"
                 done
                 reinstall_cartridge
@@ -336,7 +336,7 @@ health_check() {
     fi
     
     # Check cartridge source exists
-    if [[ ! -f "${CARTRIDGE_HOME}/plex_cartridge.sh" ]]; then
+    if [[ ! -f "${CARTRIDGE_HOME}/cartridge.sh" ]]; then
         log "HEALTH" "Cartridge source missing from: ${CARTRIDGE_HOME}"
         issues=$((issues + 1))
     fi

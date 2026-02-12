@@ -8,56 +8,60 @@
 
    Beam your transcodes to a remote GPU
 
-   ┌──────────┐          HTTP           ┌──────────────┐
-   │   PLEX   │  ════════════════════>  │  GPU WORKER  │
-   │  SERVER  │  <════════════════════  │  Intel QSV   │
-   │          │    transcoded stream    │  NVIDIA NVENC│
-   └──────────┘                         └──────────────┘
+   ┌──────────────┐        HTTP          ┌──────────────┐
+   │ PLEX or      │  ════════════════>   │  GPU WORKER  │
+   │ JELLYFIN     │  <════════════════   │  Intel QSV   │
+   │   SERVER     │   transcoded stream  │  NVIDIA NVENC│
+   └──────────────┘                      └──────────────┘
 ```
 
 # PlexBeam
 
-**Remote GPU transcoding for Plex** -- beam your transcode jobs from a Plex server to a dedicated GPU worker over your LAN.
+**Remote GPU transcoding for Plex and Jellyfin** -- beam your transcode jobs from your media server to a dedicated GPU worker over your LAN.
 
 A modern revival of the legendary [plex-remote-transcoder](https://github.com/wnielson/plex-remote-transcoder), completely rewritten from scratch with a new architecture:
 
+- **Plex + Jellyfin** -- one cartridge system that works with both media servers
 - **HTTP API** instead of SSH tunnels
-- **Streaming transcode** -- pipes output directly back to Plex, no shared filesystem required
+- **Streaming transcode** -- pipes output directly back, no shared filesystem required
 - **Self-healing cartridge** -- survives Plex updates automatically via watchdog daemon
 - **Hardware acceleration** -- Intel QSV, NVIDIA NVENC, VAAPI
-- **Docker or bare-metal** -- run Plex in Docker with the cartridge pre-installed, or install on bare metal
+- **Docker or bare-metal** -- run in Docker with the cartridge pre-installed, or install on bare metal
 - **Cross-platform worker** -- runs on Windows or Linux
 - **Automatic fallback** -- gracefully falls back to local transcoding if the worker is down
 
 ## How It Works
 
 ```
-1. You press Play in Plex
-            |
-2. Plex calls its "Plex Transcoder" binary
-            |
-3. PlexBeam intercepts the call (it IS the binary)
-            |
-4. Dispatches the job to your GPU worker via HTTP
-            |
-5. Worker runs FFmpeg with QSV/NVENC hardware encoding
-            |
-6. Transcoded stream pipes back to Plex
-            |
-7. You're watching -- powered by a remote GPU
+Plex mode:                              Jellyfin mode:
+1. You press Play in Plex               1. You press Play in Jellyfin
+           |                                        |
+2. Plex calls "Plex Transcoder"         2. Jellyfin calls ffmpeg (our shim)
+           |                                        |
+3. PlexBeam intercepts (IS the binary)  3. PlexBeam intercepts the call
+           |                                        |
+4. Dispatches to GPU worker via HTTP    4. Dispatches to GPU worker via HTTP
+           |                                        |
+5. Worker filters Plex quirks + encodes 5. Worker passes through clean args
+           |                                        |
+6. Transcoded stream pipes back         6. Transcoded stream pipes back
+           |                                        |
+7. You're watching -- remote GPU!       7. You're watching -- remote GPU!
 ```
 
 ## Quick Start
 
-### Option A: Docker (Plex + Cartridge)
+### Option A: Docker (Plex or Jellyfin + Cartridge)
 
 ```bash
 # Copy and configure .env
 cp .env.example .env
 # Edit .env with your settings (worker URL, media path, etc.)
 
-# Start Plex with cartridge pre-installed
-docker compose up -d plex
+# Start your media server with cartridge pre-installed:
+docker compose up -d plex       # Plex
+docker compose up -d jellyfin   # Jellyfin
+docker compose up -d plex jellyfin  # Both
 
 # Start GPU worker (pick one):
 docker compose --profile nvidia up -d   # NVIDIA GPU (Linux)
@@ -90,11 +94,16 @@ PLEX_WORKER_MEDIA_PATH_FROM=/media
 PLEX_WORKER_MEDIA_PATH_TO=C:/Users/you/media
 ```
 
-### Option C: Bare-Metal Cartridge (Linux Plex Server)
+### Option C: Bare-Metal Cartridge (Linux Server)
 
 ```bash
 cd cartridge
+
+# Plex (auto-detected)
 sudo ./install.sh --worker http://YOUR_GPU_PC:8765
+
+# Jellyfin (auto-detected, or explicit)
+sudo ./install.sh --server jellyfin --worker http://YOUR_GPU_PC:8765
 ```
 
 ### Play Something
@@ -110,12 +119,13 @@ curl http://localhost:8765/jobs      # Shows active transcode jobs
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    PLEX SERVER (Docker or Linux)                  |
+│            PLEX or JELLYFIN SERVER (Docker or Linux)              |
 │                                                                  |
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │  CARTRIDGE (replaces "Plex Transcoder")                    │  │
+│  │  CARTRIDGE                                                 │  │
+│  │  Plex: replaces "Plex Transcoder" binary                   │  │
+│  │  Jellyfin: shim script pointed to by encoding.xml          │  │
 │  │  * Intercepts all transcode requests                       │  │
-│  │  * Self-heals after Plex updates (watchdog)                │  │
 │  │  * Dispatches to remote GPU via HTTP                       │  │
 │  │  * Falls back to local if worker unavailable               │  │
 │  └────────────────────────────────────────────────────────────┘  │
@@ -129,17 +139,21 @@ curl http://localhost:8765/jobs      # Shows active transcode jobs
 │              GPU WORKER (Windows/Linux, Docker or bare-metal)     │
 │                                                                   │
 │  FastAPI service + FFmpeg with hardware acceleration              │
+│  Routes: Plex args get filtered, Jellyfin args pass through      │
 │  Intel QSV | NVIDIA NVENC | VAAPI                                 │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Docker Deployment
 
-The Docker setup uses [linuxserver/plex](https://github.com/linuxserver/docker-plex) as the base image with the PlexBeam cartridge pre-installed via S6 overlay init scripts.
+The Docker setup uses [linuxserver/plex](https://github.com/linuxserver/docker-plex) and [linuxserver/jellyfin](https://github.com/linuxserver/docker-jellyfin) as base images with the PlexBeam cartridge pre-installed via S6 overlay init scripts.
 
 ```bash
 # Plex only (worker runs elsewhere)
 docker compose up -d plex
+
+# Jellyfin only
+docker compose up -d jellyfin
 
 # Full stack with NVIDIA worker
 docker compose --profile nvidia up -d
@@ -148,10 +162,9 @@ docker compose --profile nvidia up -d
 docker compose --profile intel up -d
 ```
 
-The Plex container automatically:
-1. Backs up the real Plex Transcoder binary
-2. Installs the PlexBeam cartridge in its place
-3. Runs a watchdog that re-installs after Plex updates
+**Plex container:** Backs up the real transcoder binary, installs cartridge in its place, runs a watchdog that re-installs after Plex updates.
+
+**Jellyfin container:** Installs a shim script and configures `encoding.xml` to point at it. No watchdog needed -- Jellyfin doesn't overwrite the ffmpeg binary.
 
 ### Docker + Bare-Metal Worker (Windows)
 
@@ -223,8 +236,11 @@ PLEX_CONFIG_PATH=./config/plex
 ### Cartridge Installation (bare-metal)
 
 ```bash
-# Basic
+# Plex (auto-detected)
 sudo ./install.sh --worker http://GPU_PC:8765
+
+# Jellyfin (auto-detected, or explicit)
+sudo ./install.sh --server jellyfin --worker http://GPU_PC:8765
 
 # With auth
 sudo ./install.sh --worker http://GPU_PC:8765 --api-key your-secret
@@ -277,22 +293,24 @@ curl http://localhost:8765/jobs            # List active jobs
 
 ```
 plexbeam/
-├── docker-compose.yml         # Full-stack Docker Compose
+├── docker-compose.yml         # Full-stack Docker Compose (Plex + Jellyfin + workers)
 ├── .env.example               # Environment variable template
-├── cartridge/                 # Plex server component
-│   ├── Dockerfile             # Docker image (linuxserver/plex + cartridge)
-│   ├── docker-init.sh         # S6 init script (installs cartridge on boot)
-│   ├── docker-watchdog.sh     # S6 service (re-installs after Plex updates)
-│   ├── plex_cartridge.sh      # The interceptor script
-│   ├── watchdog.sh            # Self-healing daemon
-│   ├── install.sh             # Bare-metal installer
+├── cartridge/                 # Media server component (Plex + Jellyfin)
+│   ├── cartridge.sh           # Universal interceptor script (Plex + Jellyfin)
+│   ├── Dockerfile             # Plex Docker image (linuxserver/plex + cartridge)
+│   ├── Dockerfile.jellyfin    # Jellyfin Docker image (linuxserver/jellyfin + cartridge)
+│   ├── docker-init.sh         # Plex S6 init script
+│   ├── docker-init-jellyfin.sh # Jellyfin S6 init script
+│   ├── docker-watchdog.sh     # S6 service (Plex only)
+│   ├── watchdog.sh            # Self-healing daemon (Plex only)
+│   ├── install.sh             # Bare-metal installer (--server plex|jellyfin)
 │   ├── uninstall.sh           # Clean removal
 │   └── analyze.sh             # Session analyzer
 ├── worker/                    # GPU worker (Windows/Linux)
 │   ├── Dockerfile.nvidia      # NVIDIA NVENC Docker image
 │   ├── Dockerfile.intel       # Intel QSV Docker image (Linux)
-│   ├── worker.py              # FastAPI service
-│   ├── transcoder.py          # FFmpeg wrapper with HW accel
+│   ├── worker.py              # FastAPI service (routes Plex/Jellyfin args)
+│   ├── transcoder.py          # FFmpeg wrapper with HW accel + source routing
 │   ├── config.py              # Pydantic settings
 │   └── requirements.txt       # Python dependencies
 ├── protocol/                  # Shared definitions
@@ -300,13 +318,15 @@ plexbeam/
 └── docs/                      # Guides
     ├── architecture.md
     ├── setup-linux.md
-    └── setup-windows.md
+    ├── setup-windows.md
+    └── setup-jellyfin.md
 ```
 
 ## Documentation
 
 - [Architecture Overview](docs/architecture.md)
 - [Linux Plex Server Setup](docs/setup-linux.md)
+- [Jellyfin Setup](docs/setup-jellyfin.md)
 - [Windows GPU Worker Setup](docs/setup-windows.md)
 
 ## Credits

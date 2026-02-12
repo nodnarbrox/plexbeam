@@ -2,18 +2,19 @@
 
 ## Overview
 
-PlexBeam enables remote GPU transcoding for Plex by intercepting transcode requests and dispatching them to a dedicated GPU worker over HTTP.
+PlexBeam enables remote GPU transcoding for **Plex and Jellyfin** by intercepting transcode requests and dispatching them to a dedicated GPU worker over HTTP. One unified cartridge system works with both media servers.
 
 ## System Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  PLEX SERVER (Docker or Linux)                    │
+│          PLEX or JELLYFIN SERVER (Docker or Linux)                │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │  CARTRIDGE (replaces "Plex Transcoder")                    │  │
+│  │  CARTRIDGE (cartridge.sh)                                  │  │
+│  │  Plex:     replaces "Plex Transcoder" binary               │  │
+│  │  Jellyfin: shim script in /opt/plexbeam/                   │  │
 │  │  - Intercepts all transcode requests                       │  │
-│  │  - Self-heals after Plex updates (watchdog)                │  │
 │  │  - Dispatches to remote GPU via HTTP API                   │  │
 │  │  - Falls back to local if worker unavailable               │  │
 │  └────────────────────────────────────────────────────────────┘  │
@@ -32,6 +33,7 @@ PlexBeam enables remote GPU transcoding for Plex by intercepting transcode reque
 │  │  - POST /transcode - Queued transcode jobs                 │  │
 │  │  - GET /status/{id} - Job progress                         │  │
 │  │  - GET /health - Health check                              │  │
+│  │  Routes based on "source": Plex=filtered, Jellyfin=clean   │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                           |                                      │
 │  ┌────────────────────────v───────────────────────────────────┐  │
@@ -47,20 +49,27 @@ PlexBeam enables remote GPU transcoding for Plex by intercepting transcode reque
 
 ## Components
 
-### 1. Cartridge (Plex Server)
+### 1. Cartridge (Plex or Jellyfin Server)
 
-**Location:** `/opt/plex-cartridge/`
+**Location:** `/opt/plex-cartridge/` (Plex) or `/opt/plexbeam/` (Jellyfin)
 
-The cartridge is a shell script that replaces Plex's `Plex Transcoder` binary. When Plex initiates a transcode:
+The cartridge (`cartridge.sh`) is a universal shell script with a `SERVER_TYPE` variable that controls behavior:
+
+**Plex mode:** Replaces the `Plex Transcoder` binary. On local fallback, rewrites Plex-specific args (aac_lc, ochl, QSV pipeline).
+
+**Jellyfin mode:** Installed as a shim script; Jellyfin's `encoding.xml` points at it. On local fallback, passes args through unmodified (Jellyfin uses standard ffmpeg).
+
+When a transcode starts:
 
 1. Cartridge intercepts the call with all arguments
 2. Checks if the job is a video copy (direct stream) -- if so, runs locally
 3. POSTs raw FFmpeg arguments to the remote GPU worker's streaming endpoint
-4. Pipes the transcoded stream back to Plex
-5. Falls back to local transcoding if the worker is unreachable
+4. Worker receives the `"source"` field ("plex" or "jellyfin") for routing
+5. Pipes the transcoded stream back to the media server
+6. Falls back to local transcoding if the worker is unreachable
 
 **Key Features:**
-- **Self-Healing:** Watchdog daemon monitors for Plex updates and reinstalls cartridge
+- **Self-Healing:** Watchdog daemon monitors for Plex updates (Plex only)
 - **Pattern Learning:** Logs unique argument patterns for analysis
 - **Streaming:** Pipes output directly back, no shared filesystem needed
 - **Fallback:** Gracefully falls back to local transcoding
@@ -69,8 +78,9 @@ The cartridge is a shell script that replaces Plex's `Plex Transcoder` binary. W
 
 **Location:** Any machine with a GPU
 
-The worker is a Python FastAPI service that:
+The worker is a Python FastAPI service that routes based on the `source` field:
 
+**Plex source:**
 1. Receives raw Plex FFmpeg arguments via HTTP
 2. Filters Plex-specific options that standard FFmpeg doesn't understand
 3. Replaces `libx264` with hardware encoder (h264_qsv, h264_nvenc, etc.)
@@ -78,8 +88,14 @@ The worker is a Python FastAPI service that:
 5. Executes FFmpeg with hardware acceleration
 6. Streams output back to the cartridge via HTTP response
 
+**Jellyfin source:**
+1. Receives standard FFmpeg arguments via HTTP
+2. Applies media path mapping only (args are already clean)
+3. Executes FFmpeg with hardware acceleration
+4. Streams output back
+
 **Plex FFmpeg Compatibility:**
-The worker handles several Plex-specific quirks:
+The worker handles several Plex-specific quirks (skipped for Jellyfin):
 - Strips `-loglevel_plex`, `-progressurl`, `-time_delta` and other Plex-only options
 - Replaces `aac_lc` codec name with standard `aac`
 - Rewrites `ochl` to `ocl` for older FFmpeg versions (<5.0)
@@ -163,16 +179,18 @@ For jobs that write to shared storage:
 The Docker image uses a template system for the cartridge:
 
 ```
-.orig template (6 placeholders)
+.orig template (7 placeholders)
     |
-    v  docker-init.sh bakes Docker env vars (3 of 6)
+    v  docker-init.sh bakes Docker env vars (4 of 7: SERVER_TYPE + 3 env vars)
 Pre-baked template (3 path placeholders remain)
     |
     v  docker-init.sh bakes path vars (remaining 3)
-Active cartridge (all 6 resolved)
+Active cartridge (all 7 resolved)
 ```
 
-When the watchdog reinstalls after a Plex update, it reads the pre-baked template (not the `.orig`), so Docker environment variables survive the reinstall.
+When the watchdog reinstalls after a Plex update, it reads the pre-baked template (not the `.orig`), so Docker environment variables (including SERVER_TYPE) survive the reinstall.
+
+**Jellyfin Docker:** Uses `docker-init-jellyfin.sh` which bakes all 7 placeholders at once into a shim at `/opt/plexbeam/cartridge-active.sh`. No watchdog needed.
 
 ## Hardware Acceleration
 
@@ -236,40 +254,30 @@ Requirements:
 
 ## Docker Deployment
 
-PlexBeam uses [linuxserver/plex](https://github.com/linuxserver/docker-plex) as the base image with S6 overlay v3 for service management.
+PlexBeam uses [linuxserver/plex](https://github.com/linuxserver/docker-plex) and [linuxserver/jellyfin](https://github.com/linuxserver/docker-jellyfin) as base images with S6 overlay v3 for service management.
 
 ```yaml
 # docker-compose.yml
 services:
   plex:
     build: ./cartridge        # linuxserver/plex + cartridge
-    ports:
-      - "32400:32400"
     environment:
       - PLEXBEAM_WORKER_URL=http://worker:8765
-    volumes:
-      - ./config/plex:/config
-      - /mnt/media:/media
+
+  jellyfin:
+    build:
+      context: ./cartridge
+      dockerfile: Dockerfile.jellyfin  # linuxserver/jellyfin + cartridge
+    environment:
+      - PLEXBEAM_WORKER_URL=http://worker:8765
 
   worker-nvidia:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile.nvidia
     profiles: [nvidia]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu, video]
+    # NVIDIA GPU
 
   worker-intel:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile.intel
     profiles: [intel]
-    # Requires /dev/dri passthrough on Linux
+    # Intel QSV (Linux only, requires /dev/dri)
 ```
 
 **Windows Docker + Bare-Metal Worker:**

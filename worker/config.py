@@ -86,6 +86,14 @@ class WorkerSettings(BaseSettings):
         description="Host media path to replace with (e.g., C:/Users/me/plex-remote/config/media)"
     )
 
+    # Multiple path mappings (semicolon-delimited from=to pairs)
+    # Supplements media_path_from/to. Use for mapping additional container paths.
+    # Example: PLEX_WORKER_PATH_MAPPINGS="/config=C:/Users/me/config/jellyfin;/tmp=C:/temp"
+    path_mappings: Optional[str] = Field(
+        default=None,
+        description="Additional path mappings as semicolon-delimited from=to pairs"
+    )
+
     # Job settings
     max_concurrent_jobs: int = Field(
         default=2,
@@ -132,6 +140,21 @@ class WorkerSettings(BaseSettings):
         env_prefix = "PLEX_WORKER_"
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    def get_path_mappings(self) -> list[tuple[str, str]]:
+        """Get all path mappings (from, to) sorted longest-prefix-first."""
+        mappings = []
+        if self.media_path_from and self.media_path_to:
+            mappings.append((self.media_path_from, self.media_path_to))
+        if self.path_mappings:
+            for pair in self.path_mappings.split(";"):
+                pair = pair.strip()
+                if "=" in pair:
+                    frm, to = pair.split("=", 1)
+                    mappings.append((frm.strip(), to.strip()))
+        # Sort longest prefix first so /config/cache matches before /config
+        mappings.sort(key=lambda m: len(m[0]), reverse=True)
+        return mappings
 
     def get_ffmpeg_hwaccel_args(self) -> list[str]:
         """Get FFmpeg hardware acceleration arguments based on settings."""

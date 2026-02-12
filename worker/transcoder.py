@@ -56,6 +56,7 @@ class TranscodeJob:
     output_type: str = "hls"  # hls, dash, file
     segment_duration: int = 4
     raw_args: list[str] = field(default_factory=list)
+    source: str = "plex"  # "plex" or "jellyfin"
 
     # Runtime state
     process: Optional[asyncio.subprocess.Process] = None
@@ -195,8 +196,11 @@ class FFmpegTranscoder:
             else:
                 cmd.extend(["-vf", sub_filter])
 
-        # Audio encoding
-        cmd.extend(["-c:a", job.audio_codec])
+        # Audio encoding (replace libfdk_aac with built-in aac if needed)
+        audio_codec = job.audio_codec
+        if audio_codec == "libfdk_aac":
+            audio_codec = "aac"
+        cmd.extend(["-c:a", audio_codec])
         if job.audio_bitrate:
             cmd.extend(["-b:a", job.audio_bitrate])
 
@@ -249,155 +253,276 @@ class FFmpegTranscoder:
 
         return encoders.get(hw_accel, encoders["none"])
 
+    def _filter_plex_args(self, job_id: str, raw_args: list[str], hw_accel: str, hw_encoder: str) -> list[str]:
+        """
+        Filter Plex-specific FFmpeg options from raw args.
+
+        Plex's custom ffmpeg has options standard ffmpeg doesn't understand.
+        This handles: plex_opts stripping, aac_lc->aac, ochl rewrite,
+        libx264->HW encoder replacement, filter_complex skipping, map fixing,
+        x264opts stripping, preset:0 stripping, VAAPI injection, media path mapping.
+        """
+        path_mappings = settings.get_path_mappings()
+
+        # Plex-specific options to strip
+        plex_opts_with_value = {
+            "-loglevel_plex", "-progressurl", "-loglevel",
+            "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
+            # Linux VAAPI options
+            "-hwaccel", "-hwaccel:0", "-hwaccel_device", "-hwaccel_device:0",
+            "-init_hw_device", "-filter_hw_device"
+        }
+        plex_opts_no_value = {"-nostats", "-noaccurate_seek"}
+
+        # Detect if libx264 encoding is requested (replace with HW encoder if available)
+        needs_hw_replace = hw_accel != "none" and any(
+            raw_args[i] in ("-codec:0", "-c:v") and
+            i + 1 < len(raw_args) and
+            raw_args[i + 1] == "libx264"
+            for i in range(len(raw_args))
+        )
+
+        # Track if we skip a video filter_complex so we can fix map references
+        skipped_video_filter = False
+        # Find what label the video filter creates (e.g., [1] from ...format=...[1])
+        video_filter_output_label = None
+        logger.info(f"[{job_id}] RAW PASSTHROUGH (plex): Processing {len(raw_args)} args")
+        for i, arg in enumerate(raw_args):
+            if arg == "-filter_complex" and i + 1 < len(raw_args):
+                fc = raw_args[i + 1]
+                logger.info(f"[{job_id}] Found filter_complex: {fc}")
+                if "scale=" in fc and "format=" in fc:
+                    # Extract output label like [1] from the end of the filter
+                    match = re.search(r'(\[[0-9]+\])$', fc)
+                    logger.info(f"[{job_id}] Regex match result: {match}")
+                    if match:
+                        video_filter_output_label = match.group(1)
+                        logger.info(f"[{job_id}] Found video filter output label: {video_filter_output_label}")
+                    else:
+                        logger.warning(f"[{job_id}] Could not extract output label from filter!")
+
+        filtered_args = []
+        skip_next = False
+        for i, arg in enumerate(raw_args):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in plex_opts_with_value:
+                skip_next = True  # Skip this option and its value
+                continue
+            if arg in plex_opts_no_value:
+                continue
+            # Skip Plex's Linux VAAPI args (we add our own based on hw_accel setting)
+            if "vaapi" in str(arg).lower() and hw_accel != "vaapi":
+                continue
+            # Replace libx264 with HW encoder if hardware acceleration is available
+            # Downscale to 1080p max (community preference: don't transcode at 4K)
+            if needs_hw_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(raw_args) and raw_args[i + 1] == "libx264":
+                scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+                encoder_opts = ["-c:v", hw_encoder]
+                if hw_accel == "vaapi":
+                    encoder_opts.extend(["-qp", "26"])
+                elif hw_accel == "none":
+                    encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
+                else:
+                    encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
+                filtered_args.extend([
+                    "-vf", scale_filter,
+                    *encoder_opts,
+                    "-maxrate", "10M", "-bufsize", "5M"
+                ])
+                skip_next = True
+                continue
+            # Skip high bitrate settings from Plex (we use our own lower limits)
+            if arg in ("-maxrate:0", "-bufsize:0", "-crf:0"):
+                skip_next = True
+                continue
+            # Skip video scaling filter_complex (QSV doesn't need it, and it uses VAAPI format)
+            if arg == "-filter_complex" and i + 1 < len(raw_args) and "scale=" in raw_args[i + 1] and "format=" in raw_args[i + 1]:
+                logger.info(f"[{job_id}] SKIPPING filter_complex (VAAPI scale/format) - will need to fix map refs")
+                skip_next = True
+                skipped_video_filter = True
+                continue
+            # Fix map reference if we skipped video filter - replace [1] with 0:0
+            if arg == "-map":
+                next_arg = raw_args[i + 1] if i + 1 < len(raw_args) else "N/A"
+                logger.info(f"[{job_id}] Found -map {next_arg}, skipped_video_filter={skipped_video_filter}, video_filter_output_label={video_filter_output_label}")
+            if skipped_video_filter and arg == "-map" and i + 1 < len(raw_args) and video_filter_output_label:
+                next_arg = raw_args[i + 1]
+                if next_arg == video_filter_output_label:
+                    logger.info(f"[{job_id}] Replacing -map {next_arg} with -map 0:0")
+                    filtered_args.extend(["-map", "0:0"])
+                    skip_next = True
+                    continue
+                else:
+                    logger.info(f"[{job_id}] NOT replacing -map {next_arg} (doesn't match label {video_filter_output_label})")
+            # Skip x264opts when using HW encoding (not compatible with QSV/NVENC)
+            if hw_accel != "none" and arg.startswith("-x264opts"):
+                skip_next = True
+                continue
+            # Skip -preset:0 when using HW encoding (x264/x265 option, not for VAAPI/QSV/NVENC)
+            if hw_accel != "none" and arg == "-preset:0":
+                skip_next = True
+                continue
+            # Replace Plex-specific codec names with standard ffmpeg equivalents
+            if arg == "aac_lc":
+                filtered_args.append("aac")
+                continue
+            # Rewrite Plex 'ochl' for old ffmpeg (<5.0) that only knows 'ocl'.
+            # Modern ffmpeg (5.0+) supports 'ochl' natively, so only rewrite if needed.
+            if "ochl=" in arg:
+                import subprocess as _sp
+                try:
+                    ver = _sp.check_output([settings.ffmpeg_path, "-version"], stderr=_sp.DEVNULL).decode()
+                    major = int(ver.split("version ")[1].split(".")[0])
+                    if major < 5:
+                        arg = arg.replace("ochl=", "ocl=")
+                except Exception:
+                    pass  # Keep ochl as-is if version check fails
+            # Strip file: protocol prefix (safety: Jellyfin sends file:/path)
+            if arg.startswith('file:"') and arg.endswith('"'):
+                arg = arg[6:-1]
+            elif arg.startswith("file:"):
+                arg = arg[5:]
+            # Apply all path mappings (longest prefix first)
+            for frm, to in path_mappings:
+                if arg.startswith(frm):
+                    arg = to + arg[len(frm):]
+                    break
+            filtered_args.append(arg)
+
+        # Inject VAAPI hardware acceleration args before -i
+        # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't support
+        # KMS dumb buffer allocation, so full hw decode->encode fails. Instead, decode on
+        # CPU and use format=nv12,hwupload in -vf to upload frames for GPU encoding.
+        if hw_accel == "vaapi" and needs_hw_replace:
+            device = settings.qsv_device or "/dev/dri/renderD128"
+            vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
+            for idx, a in enumerate(filtered_args):
+                if a == "-i":
+                    filtered_args[idx:idx] = vaapi_init
+                    break
+
+        return filtered_args
+
+    def _filter_standard_args(self, raw_args: list[str]) -> list[str]:
+        """
+        Filter standard ffmpeg args (e.g., Jellyfin) for GPU worker execution.
+
+        Handles: file: prefix stripping, path mappings, HW encoder replacement,
+        QSV/NVENC/VAAPI init injection, and stripping of incompatible options.
+        """
+        path_mappings = settings.get_path_mappings()
+        hw_accel = settings.hw_accel
+        hw_encoder = settings.get_video_encoder()
+
+        # Check if software encoding is requested (we'll replace with HW encoder)
+        needs_hw_replace = hw_accel != "none" and any(
+            raw_args[i] in ("-codec:v:0", "-codec:0", "-c:v", "-c:v:0", "-vcodec") and
+            i + 1 < len(raw_args) and
+            raw_args[i + 1] in ("libx264", "libx265")
+            for i in range(len(raw_args))
+        )
+
+        filtered_args = []
+        skip_next = False
+        for i, arg in enumerate(raw_args):
+            if skip_next:
+                skip_next = False
+                continue
+
+            # Strip Jellyfin's file: protocol prefix
+            if arg.startswith('file:"') and arg.endswith('"'):
+                arg = arg[6:-1]
+            elif arg.startswith("file:"):
+                arg = arg[5:]
+
+            # Replace software encoder with HW encoder
+            if needs_hw_replace and arg in ("-codec:v:0", "-codec:0", "-c:v", "-c:v:0", "-vcodec"):
+                next_arg = raw_args[i + 1] if i + 1 < len(raw_args) else ""
+                if next_arg in ("libx264", "libx265"):
+                    filtered_args.append(arg)
+                    filtered_args.append(hw_encoder)
+                    skip_next = True
+                    continue
+
+            # Strip x264opts (incompatible with HW encoders)
+            if hw_accel != "none" and arg.startswith("-x264opts"):
+                skip_next = True
+                continue
+
+            # Replace -crf with -global_quality for QSV
+            if hw_accel == "qsv" and arg in ("-crf", "-crf:0"):
+                filtered_args.append("-global_quality")
+                continue
+
+            # Strip -preset for VAAPI (doesn't support preset)
+            if hw_accel == "vaapi" and arg in ("-preset", "-preset:0"):
+                skip_next = True
+                continue
+
+            # Map x264 presets to valid QSV/NVENC presets
+            if hw_accel in ("qsv", "nvenc") and i > 0 and raw_args[i - 1] in ("-preset", "-preset:0"):
+                qsv_presets = {"ultrafast": "veryfast", "superfast": "veryfast"}
+                if arg in qsv_presets:
+                    arg = qsv_presets[arg]
+
+            # Replace libfdk_aac with built-in aac (not all ffmpeg builds have libfdk)
+            if arg == "libfdk_aac":
+                arg = "aac"
+
+            # Apply all path mappings (longest prefix first)
+            for frm, to in path_mappings:
+                if arg.startswith(frm):
+                    arg = to + arg[len(frm):]
+                    break
+            filtered_args.append(arg)
+
+        # Inject hardware acceleration init args before -i, but only if no
+        # software-space -vf filters exist (they'd conflict with hwaccel output format).
+        has_vf = any(a == "-vf" for a in filtered_args)
+        if needs_hw_replace and not has_vf:
+            hwaccel_args = []
+            if hw_accel == "qsv":
+                hwaccel_args = ["-hwaccel", "qsv"]
+                if settings.qsv_device:
+                    hwaccel_args.extend(["-qsv_device", settings.qsv_device])
+                hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
+            elif hw_accel == "nvenc":
+                hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            elif hw_accel == "vaapi":
+                device = settings.qsv_device or "/dev/dri/renderD128"
+                hwaccel_args = ["-hwaccel", "vaapi", "-vaapi_device", device]
+
+            if hwaccel_args:
+                for idx, a in enumerate(filtered_args):
+                    if a == "-i":
+                        filtered_args[idx:idx] = hwaccel_args
+                        break
+
+        return filtered_args
+
     async def transcode(
         self,
         job: TranscodeJob,
         progress_callback: Optional[Callable[[TranscodeProgress], None]] = None
     ) -> bool:
         """Execute a transcode job."""
-        # Use raw passthrough mode if raw_args are provided and output_path is empty
-        if job.raw_args and (not job.output_path or job.output_path == ""):
+        # Use raw passthrough mode for Jellyfin (always) or Plex when output_path is empty.
+        # Jellyfin sends complete ffmpeg commands; build_ffmpeg_command is only for Plex.
+        use_raw = job.raw_args and (job.source != "plex" or not job.output_path or job.output_path == "")
+        if use_raw:
             cmd = [self.ffmpeg_path, "-y", "-nostdin"]
             # Add progress reporting
             cmd.extend(["-progress", "pipe:1", "-stats_period", "0.5"])
 
-            # Filter out Plex-specific FFmpeg options that standard FFmpeg doesn't understand
-            # Also filter out -loglevel quiet so we can see errors, and -nostats
-            # Filter Linux VAAPI options (not available on Windows - use QSV instead)
-            plex_opts_with_value = {
-                "-loglevel_plex", "-progressurl", "-loglevel",
-                "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
-                # Linux VAAPI options
-                "-hwaccel", "-hwaccel:0", "-hwaccel_device", "-hwaccel_device:0",
-                "-init_hw_device", "-filter_hw_device"
-            }
-            plex_opts_no_value = {"-nostats", "-noaccurate_seek"}
-
-            # Detect if libx264 encoding is requested (replace with HW encoder if available)
             hw_accel = settings.hw_accel
-            needs_hw_replace = hw_accel != "none" and any(
-                job.raw_args[i] in ("-codec:0", "-c:v") and
-                i + 1 < len(job.raw_args) and
-                job.raw_args[i + 1] == "libx264"
-                for i in range(len(job.raw_args))
-            )
-            hw_encoder = settings.get_video_encoder()  # maps hw_accel to encoder
+            hw_encoder = settings.get_video_encoder()
 
-            # Track if we skip a video filter_complex so we can fix map references
-            skipped_video_filter = False
-            # Find what label the video filter creates (e.g., [1] from ...format=...[1])
-            video_filter_output_label = None
-            logger.info(f"[{job.job_id}] RAW PASSTHROUGH: Processing {len(job.raw_args)} args")
-            for i, arg in enumerate(job.raw_args):
-                if arg == "-filter_complex" and i + 1 < len(job.raw_args):
-                    fc = job.raw_args[i + 1]
-                    logger.info(f"[{job.job_id}] Found filter_complex: {fc}")
-                    if "scale=" in fc and "format=" in fc:
-                        # Extract output label like [1] from the end of the filter
-                        import re
-                        match = re.search(r'(\[[0-9]+\])$', fc)
-                        logger.info(f"[{job.job_id}] Regex match result: {match}")
-                        if match:
-                            video_filter_output_label = match.group(1)
-                            logger.info(f"[{job.job_id}] Found video filter output label: {video_filter_output_label}")
-                        else:
-                            logger.warning(f"[{job.job_id}] Could not extract output label from filter!")
-
-            filtered_args = []
-            skip_next = False
-            for i, arg in enumerate(job.raw_args):
-                if skip_next:
-                    skip_next = False
-                    continue
-                if arg in plex_opts_with_value:
-                    skip_next = True  # Skip this option and its value
-                    continue
-                if arg in plex_opts_no_value:
-                    continue
-                # Skip Plex's Linux VAAPI args (we add our own based on hw_accel setting)
-                if "vaapi" in str(arg).lower() and hw_accel != "vaapi":
-                    continue
-                # Replace libx264 with HW encoder if hardware acceleration is available
-                # Downscale to 1080p max (community preference: don't transcode at 4K)
-                if needs_hw_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(job.raw_args) and job.raw_args[i + 1] == "libx264":
-                    scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
-                    encoder_opts = ["-c:v", hw_encoder]
-                    if hw_accel == "vaapi":
-                        encoder_opts.extend(["-qp", "26"])
-                    elif hw_accel == "none":
-                        encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
-                    else:
-                        encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
-                    filtered_args.extend([
-                        "-vf", scale_filter,
-                        *encoder_opts,
-                        "-maxrate", "10M", "-bufsize", "5M"
-                    ])
-                    skip_next = True
-                    continue
-                # Skip high bitrate settings from Plex (we use our own lower limits)
-                if arg in ("-maxrate:0", "-bufsize:0", "-crf:0"):
-                    skip_next = True
-                    continue
-                # Skip video scaling filter_complex (QSV doesn't need it, and it uses VAAPI format)
-                if arg == "-filter_complex" and i + 1 < len(job.raw_args) and "scale=" in job.raw_args[i + 1] and "format=" in job.raw_args[i + 1]:
-                    logger.info(f"[{job.job_id}] SKIPPING filter_complex (VAAPI scale/format) - will need to fix map refs")
-                    skip_next = True
-                    skipped_video_filter = True
-                    continue
-                # Fix map reference if we skipped video filter - replace [1] with 0:0
-                if arg == "-map":
-                    next_arg = job.raw_args[i + 1] if i + 1 < len(job.raw_args) else "N/A"
-                    logger.info(f"[{job.job_id}] Found -map {next_arg}, skipped_video_filter={skipped_video_filter}, video_filter_output_label={video_filter_output_label}")
-                if skipped_video_filter and arg == "-map" and i + 1 < len(job.raw_args) and video_filter_output_label:
-                    next_arg = job.raw_args[i + 1]
-                    if next_arg == video_filter_output_label:
-                        logger.info(f"[{job.job_id}] Replacing -map {next_arg} with -map 0:0")
-                        filtered_args.extend(["-map", "0:0"])
-                        skip_next = True
-                        continue
-                    else:
-                        logger.info(f"[{job.job_id}] NOT replacing -map {next_arg} (doesn't match label {video_filter_output_label})")
-                # Skip x264opts when using HW encoding (not compatible with QSV/NVENC)
-                if hw_accel != "none" and arg.startswith("-x264opts"):
-                    skip_next = True
-                    continue
-                # Skip -preset:0 when using HW encoding (x264/x265 option, not for VAAPI/QSV/NVENC)
-                if hw_accel != "none" and arg == "-preset:0":
-                    skip_next = True
-                    continue
-                # Replace Plex-specific codec names with standard ffmpeg equivalents
-                if arg == "aac_lc":
-                    filtered_args.append("aac")
-                    continue
-                # Rewrite Plex 'ochl' for old ffmpeg (<5.0) that only knows 'ocl'.
-                # Modern ffmpeg (5.0+) supports 'ochl' natively, so only rewrite if needed.
-                if "ochl=" in arg:
-                    import subprocess as _sp
-                    try:
-                        ver = _sp.check_output([settings.ffmpeg_path, "-version"], stderr=_sp.DEVNULL).decode()
-                        major = int(ver.split("version ")[1].split(".")[0])
-                        if major < 5:
-                            arg = arg.replace("ochl=", "ocl=")
-                    except Exception:
-                        pass  # Keep ochl as-is if version check fails
-                # Apply media path mapping for bare-metal workers
-                if settings.media_path_from and settings.media_path_to:
-                    if arg.startswith(settings.media_path_from):
-                        arg = settings.media_path_to + arg[len(settings.media_path_from):]
-                filtered_args.append(arg)
-
-            # Inject VAAPI hardware acceleration args before -i
-            # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't support
-            # KMS dumb buffer allocation, so full hw decode→encode fails. Instead, decode on
-            # CPU and use format=nv12,hwupload in -vf to upload frames for GPU encoding.
-            if hw_accel == "vaapi" and needs_hw_replace:
-                device = settings.qsv_device or "/dev/dri/renderD128"
-                vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
-                for idx, a in enumerate(filtered_args):
-                    if a == "-i":
-                        filtered_args[idx:idx] = vaapi_init
-                        break
+            if job.source == "plex":
+                filtered_args = self._filter_plex_args(job.job_id, job.raw_args, hw_accel, hw_encoder)
+            else:
+                filtered_args = self._filter_standard_args(job.raw_args)
 
             # Add error-level logging so we can see failures
             cmd.extend(["-loglevel", "error"])
@@ -412,7 +537,7 @@ class FFmpegTranscoder:
                     filtered_args[-1] = str(output_dir / "output.m3u8")
 
             cmd.extend(filtered_args)
-            logger.info(f"[{job.job_id}] Using RAW PASSTHROUGH mode")
+            logger.info(f"[{job.job_id}] Using RAW PASSTHROUGH mode (source={job.source})")
         else:
             cmd = self.build_ffmpeg_command(job)
         logger.info(f"[{job.job_id}] Starting transcode: {' '.join(cmd)}")
@@ -532,7 +657,8 @@ class FFmpegTranscoder:
 def parse_plex_args_to_job(
     job_id: str,
     raw_args: list[str],
-    output_dir: Path
+    output_dir: Path,
+    source: str = "plex"
 ) -> TranscodeJob:
     """
     Parse Plex transcoder arguments into a TranscodeJob.
@@ -543,7 +669,8 @@ def parse_plex_args_to_job(
         job_id=job_id,
         input_path="",
         output_path=str(output_dir / "output.m3u8"),
-        raw_args=raw_args
+        raw_args=raw_args,
+        source=source
     )
 
     # Parse arguments

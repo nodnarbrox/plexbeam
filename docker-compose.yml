@@ -1,12 +1,14 @@
 # ============================================================================
-# PlexBeam — Full Stack Docker Compose
+# PlexBeam — Full Stack Docker Compose (Plex + Jellyfin)
 # ============================================================================
-# Runs Plex with the PlexBeam cartridge + a remote GPU worker.
+# Runs Plex and/or Jellyfin with the PlexBeam cartridge + a remote GPU worker.
 #
 # Usage:
-#   NVIDIA GPU (Linux):     docker compose --profile nvidia up -d
-#   Intel QSV (Linux):      docker compose --profile intel up -d
 #   Plex only:              docker compose up -d plex
+#   Jellyfin only:          docker compose up -d jellyfin
+#   Both servers:           docker compose up -d plex jellyfin
+#   NVIDIA GPU worker:      docker compose --profile nvidia up -d
+#   Intel QSV worker:       docker compose --profile intel up -d
 #
 # NOTE: Intel GPU Docker workers do NOT work on Windows (WSL2 lacks i915/KMS).
 # On Windows, run the worker bare-metal instead (see worker/ directory).
@@ -52,6 +54,31 @@ services:
       - ${PLEX_CONFIG_PATH:-./config/plex}:/config
       - ${MEDIA_PATH:-/mnt/media}:/media
       - ${PLEXBEAM_LOG_PATH:-./config/plex-cartridge-logs}:/var/log/plex-cartridge
+
+  # --- Jellyfin Media Server with PlexBeam Cartridge ---
+  jellyfin:
+    build:
+      context: ./cartridge
+      dockerfile: Dockerfile.jellyfin
+    container_name: plexbeam-jellyfin
+    ports:
+      - "8096:8096"
+      - "8920:8920"
+      - "7359:7359/udp"
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-America/New_York}
+      # PlexBeam cartridge settings
+      - PLEXBEAM_WORKER_URL=${PLEXBEAM_WORKER_URL:-}
+      - PLEXBEAM_API_KEY=${PLEXBEAM_API_KEY:-}
+      - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
+      - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
+    volumes:
+      - ${JELLYFIN_CONFIG_PATH:-./config/jellyfin}:/config
+      - ${MEDIA_PATH:-/mnt/media}:/media
+      - ${PLEXBEAM_JELLYFIN_LOG_PATH:-./config/plexbeam-logs}:/var/log/plexbeam
 
   # --- GPU Worker: NVIDIA NVENC ---
   worker-nvidia:

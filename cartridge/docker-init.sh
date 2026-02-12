@@ -12,7 +12,7 @@
 # Strategy:
 #   The watchdog's reinstall_cartridge() only bakes 3 of 6 placeholders
 #   (__REAL_TRANSCODER_PATH__, __CARTRIDGE_HOME__, __UPDATE_REPO__).
-#   We create a pre-baked template at CARTRIDGE_HOME/plex_cartridge.sh with
+#   We create a pre-baked template at CARTRIDGE_HOME/cartridge.sh with
 #   the 3 Docker env vars already filled. When the watchdog reads this after
 #   a Plex update, it fills the remaining 3 path placeholders — all 6 resolved.
 #
@@ -64,7 +64,7 @@ if [[ -f "$BACKUP_PATH" ]] && file "$BACKUP_PATH" 2>/dev/null | grep -qiE "ELF";
 elif [[ -f "$TRANSCODER_PATH" ]] && file "$TRANSCODER_PATH" 2>/dev/null | grep -qiE "ELF"; then
     cp -p "$TRANSCODER_PATH" "$BACKUP_PATH"
     echo "[+] Backed up real transcoder to: ${BACKUP_PATH}"
-elif [[ -f "$TRANSCODER_PATH" ]] && grep -q "PLEX CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
+elif [[ -f "$TRANSCODER_PATH" ]] && grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
     echo "[+] Cartridge already in place (previous run)"
     if [[ ! -f "$BACKUP_PATH" ]]; then
         echo "[!] ERROR: Cartridge installed but no backup binary found"
@@ -87,12 +87,12 @@ echo "$(date -Iseconds)|${PLEX_VERSION}|${FINGERPRINT}" >> "${LOG_BASE}/.plex_ve
 
 # --- Pre-bake template with Docker env vars ----------------------------------
 # The .orig file is the pristine template from the image build.
-# We bake the 3 Docker env vars into CARTRIDGE_HOME/plex_cartridge.sh so that
+# We bake the 4 Docker env vars into CARTRIDGE_HOME/cartridge.sh so that
 # when the watchdog's reinstall_cartridge() runs, it only needs to fill the
 # 3 path placeholders (__REAL_TRANSCODER_PATH__, __CARTRIDGE_HOME__, __UPDATE_REPO__).
 
-TEMPLATE="${CARTRIDGE_HOME}/plex_cartridge.sh.orig"
-PREBAKED="${CARTRIDGE_HOME}/plex_cartridge.sh"
+TEMPLATE="${CARTRIDGE_HOME}/cartridge.sh.orig"
+PREBAKED="${CARTRIDGE_HOME}/cartridge.sh"
 
 if [[ ! -f "$TEMPLATE" ]]; then
     echo "[!] ERROR: Pristine template not found at ${TEMPLATE}"
@@ -101,6 +101,7 @@ fi
 
 echo "[*] Baking Docker env vars into cartridge template..."
 sed \
+    -e "s|__SERVER_TYPE__|plex|g" \
     -e "s|__REMOTE_WORKER_URL__|${WORKER_URL}|g" \
     -e "s|__REMOTE_API_KEY__|${API_KEY}|g" \
     -e "s|__SHARED_SEGMENT_DIR__|${SHARED_DIR}|g" \
@@ -112,6 +113,7 @@ echo "[+] Pre-baked template ready (path placeholders remain for watchdog)"
 # --- Install fully-baked cartridge as the active transcoder ------------------
 echo "[*] Installing cartridge as active transcoder..."
 sed \
+    -e "s|__SERVER_TYPE__|plex|g" \
     -e "s|__REAL_TRANSCODER_PATH__|${BACKUP_PATH}|g" \
     -e "s|__CARTRIDGE_HOME__|${CARTRIDGE_HOME}|g" \
     -e "s|__UPDATE_REPO__|${UPDATE_REPO}|g" \
@@ -127,11 +129,12 @@ echo "[+] Cartridge installed at: ${TRANSCODER_PATH}"
 echo "[*] Writing install metadata..."
 cat > "${LOG_BASE}/.install_meta" << 'METAEOF'
 INSTALL_DATE="__DATE__"
+SERVER_TYPE="plex"
 TRANSCODER_PATH="__TRANSCODER_PATH__"
 BACKUP_PATH="__BACKUP_PATH__"
 PLEX_USER="abc"
 CARTRIDGE_HOME="__CARTRIDGE_HOME__"
-CARTRIDGE_VERSION="3.0.0"
+CARTRIDGE_VERSION="3.1.0"
 UPDATE_REPO="__UPDATE_REPO__"
 PLEX_VERSION="__PLEX_VERSION__"
 REMOTE_WORKER_URL="__WORKER_URL__"
@@ -163,7 +166,7 @@ chown abc:abc "$TRANSCODER_PATH" 2>/dev/null || true
 echo "[*] Verifying installation..."
 ISSUES=0
 
-if grep -q "PLEX CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
+if grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
     echo "[+] Cartridge in transcoder slot"
 else
     echo "[!] Cartridge NOT in place"

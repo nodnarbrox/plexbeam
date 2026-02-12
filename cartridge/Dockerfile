@@ -22,11 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy all cartridge scripts to permanent home
-COPY plex_cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh \
+COPY cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh \
      /opt/plex-cartridge/
 
 # Preserve pristine template (before any baking)
-RUN cp /opt/plex-cartridge/plex_cartridge.sh /opt/plex-cartridge/plex_cartridge.sh.orig
+RUN cp /opt/plex-cartridge/cartridge.sh /opt/plex-cartridge/cartridge.sh.orig
 
 # Make all scripts executable
 RUN chmod +x /opt/plex-cartridge/*.sh

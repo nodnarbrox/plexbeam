@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PLEX CARTRIDGE v3 — Installer with Remote GPU Support
+# PLEXBEAM CARTRIDGE v3.1 — Installer (Plex + Jellyfin)
 # ============================================================================
-# Auto-detects Plex, installs the cartridge, sets up the watchdog to
-# survive Plex updates, and configures remote GPU worker.
+# Auto-detects Plex or Jellyfin, installs the cartridge, sets up the watchdog
+# (Plex only), and configures remote GPU worker.
 #
-# Usage: sudo ./install.sh [--worker URL] [--api-key KEY] [--repo URL] [--no-watchdog]
+# Usage: sudo ./install.sh [--server plex|jellyfin] [--worker URL] [--api-key KEY]
+#                           [--repo URL] [--no-watchdog]
 # ============================================================================
 
 set -euo pipefail
@@ -18,9 +19,8 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-LOG_BASE="/var/log/plex-cartridge"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CARTRIDGE_SRC="${SCRIPT_DIR}/plex_cartridge.sh"
+CARTRIDGE_SRC="${SCRIPT_DIR}/cartridge.sh"
 
 # Defaults
 UPDATE_REPO="local"
@@ -28,10 +28,19 @@ INSTALL_WATCHDOG=true
 REMOTE_WORKER_URL=""
 REMOTE_API_KEY=""
 SHARED_SEGMENT_DIR=""
+SERVER_TYPE=""  # auto-detect if not specified
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --server)
+            SERVER_TYPE="$2"
+            if [[ "$SERVER_TYPE" != "plex" ]] && [[ "$SERVER_TYPE" != "jellyfin" ]]; then
+                echo "ERROR: --server must be 'plex' or 'jellyfin'"
+                exit 1
+            fi
+            shift 2
+            ;;
         --worker)
             REMOTE_WORKER_URL="$2"
             shift 2
@@ -55,6 +64,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: sudo ./install.sh [OPTIONS]"
             echo ""
+            echo "Server Options:"
+            echo "  --server TYPE      Server type: 'plex' or 'jellyfin' (default: auto-detect)"
+            echo ""
             echo "Remote GPU Options:"
             echo "  --worker URL       Remote GPU worker URL (e.g., http://192.168.1.100:8765)"
             echo "  --api-key KEY      API key for worker authentication"
@@ -66,7 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "                     Example: /home/you/plex-remote-gpu-dev"
             echo ""
             echo "Other Options:"
-            echo "  --no-watchdog      Skip watchdog installation"
+            echo "  --no-watchdog      Skip watchdog installation (always skipped for Jellyfin)"
             exit 0
             ;;
         *) echo "Unknown: $1"; exit 1 ;;
@@ -75,7 +87,7 @@ done
 
 echo ""
 echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${RESET}"
-echo -e "${CYAN}║${RESET}  ${BOLD}PLEX CARTRIDGE v3 — Remote GPU Installer${RESET}                    ${CYAN}║${RESET}"
+echo -e "${CYAN}║${RESET}  ${BOLD}PLEXBEAM CARTRIDGE v3.1 — Installer${RESET}                         ${CYAN}║${RESET}"
 echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
 
@@ -85,97 +97,145 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# --- [1/9] Detect Plex -------------------------------------------------------
-echo -e "${BOLD}[1/9] Detecting Plex installation...${RESET}"
+# --- [1/9] Detect server and transcoder --------------------------------------
+echo -e "${BOLD}[1/9] Detecting media server...${RESET}"
 
 TRANSCODER_PATH=""
 PLEX_USER=""
 
-SEARCH_PATHS=(
-    "/usr/lib/plexmediaserver"
-    "/usr/lib/plexmediaserver/Resources"
-    "/opt/plex/Application/Resources"
-    "/Applications/Plex Media Server.app/Contents/Resources"
-    "/Applications/Plex Media Server.app/Contents/MacOS"
-    "/volume1/@appstore/PlexMediaServer/Resources"
-    "/share/PlexMediaServer/Resources"
-)
+# Jellyfin ffmpeg path
+JELLYFIN_FFMPEG="/usr/lib/jellyfin-ffmpeg/ffmpeg"
 
-TRANSCODER_NAMES=(
-    "Plex Transcoder"
-    "Plex New Transcoder"
-)
-
-for search_dir in "${SEARCH_PATHS[@]}"; do
-    for tname in "${TRANSCODER_NAMES[@]}"; do
-        candidate="${search_dir}/${tname}"
-        if [[ -f "$candidate" ]]; then
-            if file "$candidate" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
-                TRANSCODER_PATH="$candidate"
-                echo -e "  ${GREEN}✓${RESET} Found binary: ${TRANSCODER_PATH}"
-                break 2
-            elif grep -q "PLEX CARTRIDGE" "$candidate" 2>/dev/null; then
-                if [[ -f "${candidate}.real" ]]; then
-                    TRANSCODER_PATH="$candidate"
-                    echo -e "  ${YELLOW}!${RESET} Cartridge already installed at: ${TRANSCODER_PATH}"
-                    echo -e "  ${GREEN}✓${RESET} Will re-install (upgrade)"
-                    break 2
-                fi
-            fi
-        fi
-    done
-done
-
-# Try running process
-if [[ -z "$TRANSCODER_PATH" ]]; then
-    RUNNING_PATH=$(pgrep -a -f "Plex Transcoder" 2>/dev/null | head -1 | awk '{print $2}' || true)
-    if [[ -n "$RUNNING_PATH" ]] && [[ -f "$RUNNING_PATH" ]]; then
-        TRANSCODER_PATH="$RUNNING_PATH"
-        echo -e "  ${GREEN}✓${RESET} Found via process: ${TRANSCODER_PATH}"
-    fi
-fi
-
-# Try package manager
-if [[ -z "$TRANSCODER_PATH" ]]; then
-    PKG_PATH=$(dpkg -L plexmediaserver 2>/dev/null | grep "Plex Transcoder" | head -1 || true)
-    [[ -z "$PKG_PATH" ]] && PKG_PATH=$(rpm -ql PlexMediaServer 2>/dev/null | grep "Plex Transcoder" | head -1 || true)
-    if [[ -n "$PKG_PATH" ]] && [[ -f "$PKG_PATH" ]]; then
-        TRANSCODER_PATH="$PKG_PATH"
-        echo -e "  ${GREEN}✓${RESET} Found via package: ${TRANSCODER_PATH}"
-    fi
-fi
-
-# Manual fallback
-if [[ -z "$TRANSCODER_PATH" ]]; then
-    echo ""
-    echo -e "${YELLOW}Could not auto-detect Plex Transcoder.${RESET}"
-    echo ""
-    echo "Common locations:"
-    echo "  Linux:    /usr/lib/plexmediaserver/Plex Transcoder"
-    echo "  Docker:   (same, inside the container)"
-    echo "  macOS:    /Applications/Plex Media Server.app/Contents/MacOS/Plex Transcoder"
-    echo ""
-    read -rp "Enter full path to Plex Transcoder binary: " TRANSCODER_PATH
-    if [[ ! -f "$TRANSCODER_PATH" ]]; then
-        echo -e "${RED}ERROR:${RESET} Not found: ${TRANSCODER_PATH}"
+if [[ "$SERVER_TYPE" == "jellyfin" ]]; then
+    # User explicitly chose Jellyfin
+    if [[ -x "$JELLYFIN_FFMPEG" ]]; then
+        TRANSCODER_PATH="$JELLYFIN_FFMPEG"
+        echo -e "  ${GREEN}✓${RESET} Jellyfin ffmpeg: ${TRANSCODER_PATH}"
+    else
+        echo -e "${RED}ERROR:${RESET} Jellyfin ffmpeg not found at ${JELLYFIN_FFMPEG}"
         exit 1
     fi
+elif [[ "$SERVER_TYPE" == "plex" ]] || [[ -z "$SERVER_TYPE" ]]; then
+    # Detect Plex first
+    SEARCH_PATHS=(
+        "/usr/lib/plexmediaserver"
+        "/usr/lib/plexmediaserver/Resources"
+        "/opt/plex/Application/Resources"
+        "/Applications/Plex Media Server.app/Contents/Resources"
+        "/Applications/Plex Media Server.app/Contents/MacOS"
+        "/volume1/@appstore/PlexMediaServer/Resources"
+        "/share/PlexMediaServer/Resources"
+    )
+
+    TRANSCODER_NAMES=(
+        "Plex Transcoder"
+        "Plex New Transcoder"
+    )
+
+    for search_dir in "${SEARCH_PATHS[@]}"; do
+        for tname in "${TRANSCODER_NAMES[@]}"; do
+            candidate="${search_dir}/${tname}"
+            if [[ -f "$candidate" ]]; then
+                if file "$candidate" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
+                    TRANSCODER_PATH="$candidate"
+                    SERVER_TYPE="plex"
+                    echo -e "  ${GREEN}✓${RESET} Found Plex binary: ${TRANSCODER_PATH}"
+                    break 2
+                elif grep -q "PLEXBEAM CARTRIDGE" "$candidate" 2>/dev/null; then
+                    if [[ -f "${candidate}.real" ]]; then
+                        TRANSCODER_PATH="$candidate"
+                        SERVER_TYPE="plex"
+                        echo -e "  ${YELLOW}!${RESET} Cartridge already installed at: ${TRANSCODER_PATH}"
+                        echo -e "  ${GREEN}✓${RESET} Will re-install (upgrade)"
+                        break 2
+                    fi
+                fi
+            fi
+        done
+    done
+
+    # Try running process (Plex)
+    if [[ -z "$TRANSCODER_PATH" ]]; then
+        RUNNING_PATH=$(pgrep -a -f "Plex Transcoder" 2>/dev/null | head -1 | awk '{print $2}' || true)
+        if [[ -n "$RUNNING_PATH" ]] && [[ -f "$RUNNING_PATH" ]]; then
+            TRANSCODER_PATH="$RUNNING_PATH"
+            SERVER_TYPE="plex"
+            echo -e "  ${GREEN}✓${RESET} Found Plex via process: ${TRANSCODER_PATH}"
+        fi
+    fi
+
+    # Try package manager (Plex)
+    if [[ -z "$TRANSCODER_PATH" ]]; then
+        PKG_PATH=$(dpkg -L plexmediaserver 2>/dev/null | grep "Plex Transcoder" | head -1 || true)
+        [[ -z "$PKG_PATH" ]] && PKG_PATH=$(rpm -ql PlexMediaServer 2>/dev/null | grep "Plex Transcoder" | head -1 || true)
+        if [[ -n "$PKG_PATH" ]] && [[ -f "$PKG_PATH" ]]; then
+            TRANSCODER_PATH="$PKG_PATH"
+            SERVER_TYPE="plex"
+            echo -e "  ${GREEN}✓${RESET} Found Plex via package: ${TRANSCODER_PATH}"
+        fi
+    fi
+
+    # Auto-detect: try Jellyfin if no Plex found and --server wasn't specified
+    if [[ -z "$TRANSCODER_PATH" ]] && [[ -z "$SERVER_TYPE" ]]; then
+        if [[ -x "$JELLYFIN_FFMPEG" ]]; then
+            TRANSCODER_PATH="$JELLYFIN_FFMPEG"
+            SERVER_TYPE="jellyfin"
+            echo -e "  ${GREEN}✓${RESET} Found Jellyfin ffmpeg: ${TRANSCODER_PATH}"
+        fi
+    fi
+
+    # Manual fallback
+    if [[ -z "$TRANSCODER_PATH" ]]; then
+        echo ""
+        echo -e "${YELLOW}Could not auto-detect Plex or Jellyfin.${RESET}"
+        echo ""
+        echo "Common locations:"
+        echo "  Plex:      /usr/lib/plexmediaserver/Plex Transcoder"
+        echo "  Jellyfin:  /usr/lib/jellyfin-ffmpeg/ffmpeg"
+        echo ""
+        read -rp "Enter full path to transcoder binary: " TRANSCODER_PATH
+        if [[ ! -f "$TRANSCODER_PATH" ]]; then
+            echo -e "${RED}ERROR:${RESET} Not found: ${TRANSCODER_PATH}"
+            exit 1
+        fi
+        if [[ -z "$SERVER_TYPE" ]]; then
+            read -rp "Server type (plex/jellyfin): " SERVER_TYPE
+        fi
+    fi
 fi
 
-# --- [2/9] Detect Plex user --------------------------------------------------
-echo -e "${BOLD}[2/9] Detecting Plex service user...${RESET}"
+# Set LOG_BASE based on server type
+if [[ "$SERVER_TYPE" == "jellyfin" ]]; then
+    LOG_BASE="/var/log/plexbeam"
+    INSTALL_WATCHDOG=false  # Jellyfin doesn't need a watchdog
+else
+    LOG_BASE="/var/log/plex-cartridge"
+fi
 
-PLEX_USER=$(stat -c '%U' "$TRANSCODER_PATH" 2>/dev/null || stat -f '%Su' "$TRANSCODER_PATH" 2>/dev/null || echo "plex")
-echo -e "  ${GREEN}✓${RESET} Plex user: ${PLEX_USER}"
+echo -e "  ${GREEN}✓${RESET} Server type: ${BOLD}${SERVER_TYPE}${RESET}"
+
+# --- [2/9] Detect service user -----------------------------------------------
+echo -e "${BOLD}[2/9] Detecting service user...${RESET}"
+
+if [[ "$SERVER_TYPE" == "jellyfin" ]]; then
+    PLEX_USER=$(stat -c '%U' "$TRANSCODER_PATH" 2>/dev/null || stat -f '%Su' "$TRANSCODER_PATH" 2>/dev/null || echo "jellyfin")
+else
+    PLEX_USER=$(stat -c '%U' "$TRANSCODER_PATH" 2>/dev/null || stat -f '%Su' "$TRANSCODER_PATH" 2>/dev/null || echo "plex")
+fi
+echo -e "  ${GREEN}✓${RESET} Service user: ${PLEX_USER}"
 
 # --- [3/9] Set up cartridge home ---------------------------------------------
 echo -e "${BOLD}[3/9] Setting up cartridge home...${RESET}"
 
-CARTRIDGE_HOME="/opt/plex-cartridge"
+if [[ "$SERVER_TYPE" == "jellyfin" ]]; then
+    CARTRIDGE_HOME="/opt/plexbeam"
+else
+    CARTRIDGE_HOME="/opt/plex-cartridge"
+fi
 mkdir -p "$CARTRIDGE_HOME"
 
 # Copy all cartridge files to permanent home
-for f in plex_cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
+for f in cartridge.sh analyze.sh install.sh uninstall.sh watchdog.sh; do
     if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
         cp "${SCRIPT_DIR}/${f}" "${CARTRIDGE_HOME}/${f}"
         chmod +x "${CARTRIDGE_HOME}/${f}"
@@ -187,31 +247,40 @@ done
 
 echo -e "  ${GREEN}✓${RESET} Cartridge home: ${CARTRIDGE_HOME}"
 
-# --- [4/9] Back up real transcoder --------------------------------------------
-echo -e "${BOLD}[4/9] Backing up real transcoder...${RESET}"
+# --- [4/9] Back up real transcoder / set up Jellyfin -------------------------
+echo -e "${BOLD}[4/9] Setting up transcoder...${RESET}"
 
-BACKUP_PATH="${TRANSCODER_PATH}.real"
+FINGERPRINT="n/a"
+PLEX_VERSION="n/a"
 
-if [[ -f "$BACKUP_PATH" ]] && file "$BACKUP_PATH" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
-    echo -e "  ${GREEN}✓${RESET} Existing backup valid: ${BACKUP_PATH}"
-elif file "$TRANSCODER_PATH" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
-    cp -p "$TRANSCODER_PATH" "$BACKUP_PATH"
-    echo -e "  ${GREEN}✓${RESET} Backed up to: ${BACKUP_PATH}"
-else
-    echo -e "  ${YELLOW}!${RESET} Transcoder isn't a binary (already shimmed?) — checking backup..."
-    if [[ -f "$BACKUP_PATH" ]]; then
-        echo -e "  ${GREEN}✓${RESET} Using existing backup"
+if [[ "$SERVER_TYPE" == "plex" ]]; then
+    BACKUP_PATH="${TRANSCODER_PATH}.real"
+
+    if [[ -f "$BACKUP_PATH" ]] && file "$BACKUP_PATH" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
+        echo -e "  ${GREEN}✓${RESET} Existing backup valid: ${BACKUP_PATH}"
+    elif file "$TRANSCODER_PATH" 2>/dev/null | grep -qiE "ELF|Mach-O|executable"; then
+        cp -p "$TRANSCODER_PATH" "$BACKUP_PATH"
+        echo -e "  ${GREEN}✓${RESET} Backed up to: ${BACKUP_PATH}"
     else
-        echo -e "${RED}ERROR:${RESET} No valid transcoder binary found."
-        exit 1
+        echo -e "  ${YELLOW}!${RESET} Transcoder isn't a binary (already shimmed?) — checking backup..."
+        if [[ -f "$BACKUP_PATH" ]]; then
+            echo -e "  ${GREEN}✓${RESET} Using existing backup"
+        else
+            echo -e "${RED}ERROR:${RESET} No valid transcoder binary found."
+            exit 1
+        fi
     fi
-fi
 
-# Fingerprint the real binary
-FINGERPRINT=$(md5sum "$BACKUP_PATH" 2>/dev/null | awk '{print $1}' || shasum "$BACKUP_PATH" 2>/dev/null | awk '{print $1}' || echo "unknown")
-PLEX_VERSION=$(strings "$BACKUP_PATH" 2>/dev/null | grep -oP '^\d+\.\d+\.\d+\.\d+-[0-9a-f]+' | head -1 || echo "unknown")
-echo -e "  ${DIM}Binary fingerprint: ${FINGERPRINT}${RESET}"
-echo -e "  ${DIM}Plex version: ${PLEX_VERSION}${RESET}"
+    # Fingerprint the real binary
+    FINGERPRINT=$(md5sum "$BACKUP_PATH" 2>/dev/null | awk '{print $1}' || shasum "$BACKUP_PATH" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    PLEX_VERSION=$(strings "$BACKUP_PATH" 2>/dev/null | grep -oP '^\d+\.\d+\.\d+\.\d+-[0-9a-f]+' | head -1 || echo "unknown")
+    echo -e "  ${DIM}Binary fingerprint: ${FINGERPRINT}${RESET}"
+    echo -e "  ${DIM}Plex version: ${PLEX_VERSION}${RESET}"
+else
+    # Jellyfin: no binary replacement — shim is a separate script
+    BACKUP_PATH="$TRANSCODER_PATH"  # The real ffmpeg stays untouched
+    echo -e "  ${GREEN}✓${RESET} Jellyfin ffmpeg: ${TRANSCODER_PATH} (not replaced)"
+fi
 
 # --- [5/9] Configure remote worker -------------------------------------------
 echo -e "${BOLD}[5/9] Configuring remote GPU worker...${RESET}"
@@ -254,37 +323,88 @@ mkdir -p "${LOG_BASE}/sessions"
 chown -R "${PLEX_USER}:${PLEX_USER}" "${LOG_BASE}" 2>/dev/null || true
 chmod -R 755 "${LOG_BASE}"
 
-# Bake paths into the cartridge
-sed \
-    -e "s|__REAL_TRANSCODER_PATH__|${BACKUP_PATH}|g" \
-    -e "s|__CARTRIDGE_HOME__|${CARTRIDGE_HOME}|g" \
-    -e "s|__UPDATE_REPO__|${UPDATE_REPO}|g" \
-    -e "s|__REMOTE_WORKER_URL__|${REMOTE_WORKER_URL}|g" \
-    -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
-    -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
-    "${CARTRIDGE_HOME}/plex_cartridge.sh" > "$TRANSCODER_PATH"
+if [[ "$SERVER_TYPE" == "plex" ]]; then
+    # Plex: bake paths into the cartridge and replace the transcoder binary
+    sed \
+        -e "s|__SERVER_TYPE__|${SERVER_TYPE}|g" \
+        -e "s|__REAL_TRANSCODER_PATH__|${BACKUP_PATH}|g" \
+        -e "s|__CARTRIDGE_HOME__|${CARTRIDGE_HOME}|g" \
+        -e "s|__UPDATE_REPO__|${UPDATE_REPO}|g" \
+        -e "s|__REMOTE_WORKER_URL__|${REMOTE_WORKER_URL}|g" \
+        -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
+        -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
+        "${CARTRIDGE_HOME}/cartridge.sh" > "$TRANSCODER_PATH"
 
-chmod 755 "$TRANSCODER_PATH"
-chown "${PLEX_USER}:${PLEX_USER}" "$TRANSCODER_PATH" 2>/dev/null || true
+    chmod 755 "$TRANSCODER_PATH"
+    chown "${PLEX_USER}:${PLEX_USER}" "$TRANSCODER_PATH" 2>/dev/null || true
 
-# Save fingerprint
-echo "$FINGERPRINT" > "${LOG_BASE}/.binary_fingerprint"
+    # Save fingerprint
+    echo "$FINGERPRINT" > "${LOG_BASE}/.binary_fingerprint"
 
-# Record version
-echo "$(date -Iseconds)|${PLEX_VERSION}|${FINGERPRINT}" >> "${LOG_BASE}/.plex_version_history"
+    # Record version
+    echo "$(date -Iseconds)|${PLEX_VERSION}|${FINGERPRINT}" >> "${LOG_BASE}/.plex_version_history"
 
-echo -e "  ${GREEN}✓${RESET} Cartridge installed"
+    echo -e "  ${GREEN}✓${RESET} Cartridge installed at: ${TRANSCODER_PATH}"
+else
+    # Jellyfin: create shim at CARTRIDGE_HOME, point encoding.xml at it
+    SHIM_PATH="${CARTRIDGE_HOME}/cartridge-active.sh"
+
+    sed \
+        -e "s|__SERVER_TYPE__|${SERVER_TYPE}|g" \
+        -e "s|__REAL_TRANSCODER_PATH__|${TRANSCODER_PATH}|g" \
+        -e "s|__CARTRIDGE_HOME__|${CARTRIDGE_HOME}|g" \
+        -e "s|__UPDATE_REPO__|${UPDATE_REPO}|g" \
+        -e "s|__REMOTE_WORKER_URL__|${REMOTE_WORKER_URL}|g" \
+        -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
+        -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
+        "${CARTRIDGE_HOME}/cartridge.sh" > "$SHIM_PATH"
+
+    chmod 755 "$SHIM_PATH"
+    chown "${PLEX_USER}:${PLEX_USER}" "$SHIM_PATH" 2>/dev/null || true
+
+    echo -e "  ${GREEN}✓${RESET} Shim installed at: ${SHIM_PATH}"
+
+    # Update Jellyfin encoding.xml if it exists
+    JELLYFIN_CONFIG_DIRS=(
+        "/etc/jellyfin"
+        "/var/lib/jellyfin/config"
+        "/config/encoding.xml"
+    )
+
+    ENCODING_XML=""
+    for dir in "${JELLYFIN_CONFIG_DIRS[@]}"; do
+        if [[ -f "${dir}/encoding.xml" ]]; then
+            ENCODING_XML="${dir}/encoding.xml"
+            break
+        elif [[ -f "$dir" ]]; then
+            ENCODING_XML="$dir"
+            break
+        fi
+    done
+
+    if [[ -n "$ENCODING_XML" ]]; then
+        # Back up existing encoding.xml
+        cp -p "$ENCODING_XML" "${ENCODING_XML}.plexbeam-backup"
+        # Update EncoderAppPath
+        sed -i "s|<EncoderAppPath>[^<]*</EncoderAppPath>|<EncoderAppPath>${SHIM_PATH}</EncoderAppPath>|" "$ENCODING_XML"
+        echo -e "  ${GREEN}✓${RESET} Updated encoding.xml: ${ENCODING_XML}"
+    else
+        echo -e "  ${YELLOW}!${RESET} encoding.xml not found — set EncoderAppPath manually:"
+        echo -e "  ${CYAN}  Dashboard → Playback → FFmpeg path → ${SHIM_PATH}${RESET}"
+    fi
+fi
 
 # --- [7/9] Write metadata -----------------------------------------------------
 echo -e "${BOLD}[7/9] Writing install metadata...${RESET}"
 
 cat > "${LOG_BASE}/.install_meta" << EOF
 INSTALL_DATE=$(date -Iseconds)
-TRANSCODER_PATH=${TRANSCODER_PATH}
-BACKUP_PATH=${BACKUP_PATH}
+SERVER_TYPE=${SERVER_TYPE}
+TRANSCODER_PATH="${TRANSCODER_PATH}"
+BACKUP_PATH="${BACKUP_PATH}"
 PLEX_USER=${PLEX_USER}
 CARTRIDGE_HOME=${CARTRIDGE_HOME}
-CARTRIDGE_VERSION=3.0.0
+CARTRIDGE_VERSION=3.1.0
 UPDATE_REPO=${UPDATE_REPO}
 PLEX_VERSION=${PLEX_VERSION}
 REMOTE_WORKER_URL=${REMOTE_WORKER_URL}
@@ -294,8 +414,8 @@ EOF
 
 echo -e "  ${GREEN}✓${RESET} Metadata saved"
 
-# --- [8/9] Install watchdog ---------------------------------------------------
-if [[ "$INSTALL_WATCHDOG" == true ]]; then
+# --- [8/9] Install watchdog (Plex only) --------------------------------------
+if [[ "$INSTALL_WATCHDOG" == true ]] && [[ "$SERVER_TYPE" == "plex" ]]; then
     echo -e "${BOLD}[8/9] Setting up watchdog...${RESET}"
 
     # Try systemd first
@@ -347,7 +467,11 @@ UNIT
         echo -e "  ${GREEN}✓${RESET} Watchdog cron installed (checks every minute)"
     fi
 else
-    echo -e "${BOLD}[8/9] Skipping watchdog (--no-watchdog)${RESET}"
+    if [[ "$SERVER_TYPE" == "jellyfin" ]]; then
+        echo -e "${BOLD}[8/9] Skipping watchdog (not needed for Jellyfin)${RESET}"
+    else
+        echo -e "${BOLD}[8/9] Skipping watchdog (--no-watchdog)${RESET}"
+    fi
 fi
 
 # --- [9/9] Verify everything -------------------------------------------------
@@ -356,19 +480,30 @@ echo -e "${BOLD}[9/9] Verification...${RESET}"
 ISSUES=0
 
 # Cartridge in place?
-if grep -q "PLEX CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
-    echo -e "  ${GREEN}✓${RESET} Cartridge in transcoder slot"
-else
-    echo -e "  ${RED}✗${RESET} Cartridge NOT in place"
-    ISSUES=$((ISSUES + 1))
-fi
+if [[ "$SERVER_TYPE" == "plex" ]]; then
+    if grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${RESET} Cartridge in transcoder slot"
+    else
+        echo -e "  ${RED}✗${RESET} Cartridge NOT in place"
+        ISSUES=$((ISSUES + 1))
+    fi
 
-# Real binary accessible?
-if [[ -x "$BACKUP_PATH" ]]; then
-    echo -e "  ${GREEN}✓${RESET} Real transcoder backed up"
+    # Real binary accessible?
+    if [[ -x "$BACKUP_PATH" ]]; then
+        echo -e "  ${GREEN}✓${RESET} Real transcoder backed up"
+    else
+        echo -e "  ${RED}✗${RESET} Real transcoder backup missing"
+        ISSUES=$((ISSUES + 1))
+    fi
 else
-    echo -e "  ${RED}✗${RESET} Real transcoder backup missing"
-    ISSUES=$((ISSUES + 1))
+    # Jellyfin: check shim exists
+    SHIM_PATH="${CARTRIDGE_HOME}/cartridge-active.sh"
+    if [[ -x "$SHIM_PATH" ]] && grep -q "PLEXBEAM CARTRIDGE" "$SHIM_PATH" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${RESET} Cartridge shim installed"
+    else
+        echo -e "  ${RED}✗${RESET} Cartridge shim missing"
+        ISSUES=$((ISSUES + 1))
+    fi
 fi
 
 # Log dir writable?
@@ -380,7 +515,7 @@ else
 fi
 
 # Cartridge home in place?
-if [[ -f "${CARTRIDGE_HOME}/plex_cartridge.sh" ]]; then
+if [[ -f "${CARTRIDGE_HOME}/cartridge.sh" ]]; then
     echo -e "  ${GREEN}✓${RESET} Cartridge home intact"
 else
     echo -e "  ${RED}✗${RESET} Cartridge home missing files"
@@ -391,7 +526,7 @@ fi
 echo ""
 if [[ $ISSUES -eq 0 ]]; then
     echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${GREEN}║${RESET}  ${BOLD}CARTRIDGE v3 INSTALLED — REMOTE GPU READY${RESET}                  ${GREEN}║${RESET}"
+    echo -e "${GREEN}║${RESET}  ${BOLD}PLEXBEAM v3.1 INSTALLED — ${SERVER_TYPE^^} READY${RESET}                      ${GREEN}║${RESET}"
     echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${RESET}"
 else
     echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${RESET}"
@@ -400,7 +535,7 @@ else
 fi
 
 echo ""
-echo -e "  ${BOLD}What's new in v3:${RESET}"
+echo -e "  ${BOLD}PlexBeam v3.1 — ${SERVER_TYPE^} mode:${RESET}"
 echo ""
 echo -e "  🖥️  ${BOLD}Remote GPU Transcoding${RESET}"
 if [[ -n "$REMOTE_WORKER_URL" ]]; then
@@ -409,12 +544,14 @@ if [[ -n "$REMOTE_WORKER_URL" ]]; then
     echo "     Falls back to local transcoding if worker is unavailable."
 else
     echo "     Not configured — using local transcoding."
-    echo "     To enable: sudo ./install.sh --worker http://192.168.1.100:8765"
+    echo "     To enable: sudo ./install.sh --server ${SERVER_TYPE} --worker http://192.168.1.100:8765"
 fi
-echo ""
-echo -e "  🛡️  ${BOLD}Plex updates can't kill it${RESET}"
-echo "     The watchdog detects when Plex overwrites the transcoder"
-echo "     and re-installs the cartridge within 30 seconds."
+if [[ "$SERVER_TYPE" == "plex" ]]; then
+    echo ""
+    echo -e "  🛡️  ${BOLD}Plex updates can't kill it${RESET}"
+    echo "     The watchdog detects when Plex overwrites the transcoder"
+    echo "     and re-installs the cartridge within 30 seconds."
+fi
 echo ""
 echo -e "  🔄  ${BOLD}Self-updating${RESET}"
 if [[ "$UPDATE_REPO" != "local" ]]; then
