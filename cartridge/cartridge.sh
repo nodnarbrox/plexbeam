@@ -189,6 +189,17 @@ done
 # Last argument is typically the output
 [[ -z "$OUTPUT_TARGET" ]] && OUTPUT_TARGET="${!#}"
 
+# Resolve relative output paths to absolute so the remote worker knows where
+# to write segments.  Plex sets CWD to its transcode session directory and
+# passes a relative path like "dash".  Without this, the worker writes to its
+# own working directory and Plex never sees the segments.
+if [[ -n "$OUTPUT_TARGET" ]] && [[ "$OUTPUT_TARGET" != /* ]] && [[ "$OUTPUT_TARGET" != http* ]]; then
+    OUTPUT_TARGET="$(pwd)/$OUTPUT_TARGET"
+    # Update the last raw_arg to the absolute path
+    RAW_ARGS[-1]="$OUTPUT_TARGET"
+    OUTPUT_DIR="$(dirname "$OUTPUT_TARGET")"
+fi
+
 # --- Capture session info ----------------------------------------------------
 {
     echo "═══════════════════════════════════════════════════════════════"

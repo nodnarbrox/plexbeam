@@ -4,6 +4,7 @@ Plex Remote GPU Worker - FFmpeg Transcoder with Hardware Acceleration
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -335,10 +336,12 @@ class FFmpegTranscoder:
         """
         path_mappings = settings.get_path_mappings()
 
-        # Plex-specific options to strip
+        # Plex-specific options to strip (only options that standard ffmpeg
+        # doesn't understand).  Keep DASH muxer options like -manifest_name,
+        # -delete_removed, -skip_to_segment — they're valid ffmpeg options and
+        # -manifest_name is how Plex learns segments are ready.
         plex_opts_with_value = {
-            "-loglevel_plex", "-progressurl", "-loglevel",
-            "-delete_removed", "-skip_to_segment", "-manifest_name", "-time_delta",
+            "-loglevel_plex", "-progressurl", "-loglevel", "-time_delta",
             # Linux VAAPI options
             "-hwaccel", "-hwaccel:0", "-hwaccel_device", "-hwaccel_device:0",
             "-init_hw_device", "-filter_hw_device"
@@ -686,14 +689,21 @@ class FFmpegTranscoder:
             # Add error-level logging so we can see failures
             cmd.extend(["-loglevel", "error"])
 
-            # If last arg is just "dash" or "hls", replace with proper output path
-            if filtered_args and filtered_args[-1] in ("dash", "hls"):
-                output_dir = Path(settings.temp_dir) / job.job_id
-                output_dir.mkdir(parents=True, exist_ok=True)
-                if filtered_args[-1] == "dash":
-                    filtered_args[-1] = str(output_dir / "output.mpd")
-                else:
-                    filtered_args[-1] = str(output_dir / "output.m3u8")
+            # If last arg is just "dash" or "hls" (relative), replace with temp path.
+            # If it's an absolute path (cartridge resolved CWD), use it directly and
+            # ensure the parent directory exists.
+            if filtered_args:
+                last_arg = filtered_args[-1]
+                if last_arg in ("dash", "hls"):
+                    output_dir = Path(settings.temp_dir) / job.job_id
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    if last_arg == "dash":
+                        filtered_args[-1] = str(output_dir / "output.mpd")
+                    else:
+                        filtered_args[-1] = str(output_dir / "output.m3u8")
+                elif os.path.isabs(last_arg) or (len(last_arg) > 2 and last_arg[1] == ':'):
+                    # Absolute path — ensure parent directory exists
+                    Path(last_arg).parent.mkdir(parents=True, exist_ok=True)
 
             cmd.extend(filtered_args)
             logger.info(f"[{job.job_id}] Using RAW PASSTHROUGH mode (source={job.source})")
