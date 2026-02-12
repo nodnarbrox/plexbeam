@@ -140,14 +140,18 @@ class FFmpegTranscoder:
         if hw_accel == "qsv":
             cmd.extend([
                 "-preset", job.preset,
-                "-global_quality", str(job.quality)
+                "-global_quality", str(job.quality),
             ])
+            if settings.qsv_low_power:
+                cmd.extend(["-low_power", "1"])
+            cmd.extend(["-async_depth", "1", "-extra_hw_frames", "8"])
             if job.video_bitrate:
                 cmd.extend(["-b:v", job.video_bitrate])
         elif hw_accel == "nvenc":
             cmd.extend([
                 "-preset", settings.nvenc_preset,
-                "-cq", str(job.quality)
+                "-tune", settings.nvenc_tune,
+                "-cq", str(job.quality),
             ])
             if job.video_bitrate:
                 cmd.extend(["-b:v", job.video_bitrate])
@@ -318,14 +322,26 @@ class FFmpegTranscoder:
             # Replace libx264 with HW encoder if hardware acceleration is available
             # Downscale to 1080p max (community preference: don't transcode at 4K)
             if needs_hw_replace and arg in ("-codec:0", "-c:v") and i + 1 < len(raw_args) and raw_args[i + 1] == "libx264":
-                scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2" if hw_accel == "vaapi" else "scale=1920:-2"
+                if hw_accel == "vaapi":
+                    scale_filter = "format=nv12,hwupload,scale_vaapi=w=1920:h=-2"
+                elif hw_accel == "qsv":
+                    scale_filter = "scale_qsv=w=1920:h=-2"
+                elif hw_accel == "nvenc":
+                    scale_filter = "scale_cuda=1920:-2"
+                else:
+                    scale_filter = "scale=1920:-2"
                 encoder_opts = ["-c:v", hw_encoder]
                 if hw_accel == "vaapi":
-                    encoder_opts.extend(["-qp", "26"])
+                    encoder_opts.extend(["-qp", "25"])
+                elif hw_accel == "qsv":
+                    encoder_opts.extend([
+                        "-preset", "veryfast", "-global_quality", "25",
+                        "-low_power", "1", "-async_depth", "1",
+                    ])
+                elif hw_accel == "nvenc":
+                    encoder_opts.extend(["-preset", "p1", "-tune", "ull", "-cq", "25"])
                 elif hw_accel == "none":
-                    encoder_opts.extend(["-preset", "veryfast", "-crf", "26"])
-                else:
-                    encoder_opts.extend(["-preset", "veryfast", "-global_quality", "26"])
+                    encoder_opts.extend(["-preset", "veryfast", "-crf", "25"])
                 filtered_args.extend([
                     "-vf", scale_filter,
                     *encoder_opts,
@@ -391,17 +407,42 @@ class FFmpegTranscoder:
                     break
             filtered_args.append(arg)
 
-        # Inject VAAPI hardware acceleration args before -i
-        # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't support
-        # KMS dumb buffer allocation, so full hw decode->encode fails. Instead, decode on
-        # CPU and use format=nv12,hwupload in -vf to upload frames for GPU encoding.
-        if hw_accel == "vaapi" and needs_hw_replace:
-            device = settings.qsv_device or "/dev/dri/renderD128"
-            vaapi_init = ["-hwaccel", "vaapi", "-vaapi_device", device]
+        # Inject hardware acceleration args before -i for ALL hw_accel types
+        # HW decode is the #1 speed win — 4K HEVC decode on CPU is the bottleneck
+        if needs_hw_replace:
+            # Check for actual SOFTWARE filters (not HW scale filters like scale_qsv/scale_cuda)
+            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload")
+            has_sw_filter = False
             for idx, a in enumerate(filtered_args):
-                if a == "-i":
-                    filtered_args[idx:idx] = vaapi_init
-                    break
+                if a in ("-vf", "-filter_complex") and idx + 1 < len(filtered_args):
+                    fval = filtered_args[idx + 1]
+                    if not any(kw in fval for kw in hw_filter_keywords):
+                        has_sw_filter = True
+                        break
+            hwaccel_args = []
+
+            if hw_accel == "qsv":
+                hwaccel_args = ["-hwaccel", "qsv"]
+                if settings.qsv_device:
+                    hwaccel_args.extend(["-qsv_device", settings.qsv_device])
+                if not has_sw_filter:
+                    hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
+                hwaccel_args.extend(["-extra_hw_frames", "8"])
+            elif hw_accel == "nvenc":
+                hwaccel_args = ["-hwaccel", "cuda"]
+                if not has_sw_filter:
+                    hwaccel_args.extend(["-hwaccel_output_format", "cuda"])
+            elif hw_accel == "vaapi":
+                # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't
+                # support KMS dumb buffer allocation. Decode on CPU, use hwupload in -vf.
+                device = settings.qsv_device or "/dev/dri/renderD128"
+                hwaccel_args = ["-hwaccel", "vaapi", "-vaapi_device", device]
+
+            if hwaccel_args:
+                for idx, a in enumerate(filtered_args):
+                    if a == "-i":
+                        filtered_args[idx:idx] = hwaccel_args
+                        break
 
         return filtered_args
 
@@ -437,12 +478,18 @@ class FFmpegTranscoder:
             elif arg.startswith("file:"):
                 arg = arg[5:]
 
-            # Replace software encoder with HW encoder
+            # Replace software encoder with HW encoder + inject speed flags
             if needs_hw_replace and arg in ("-codec:v:0", "-codec:0", "-c:v", "-c:v:0", "-vcodec"):
                 next_arg = raw_args[i + 1] if i + 1 < len(raw_args) else ""
                 if next_arg in ("libx264", "libx265"):
                     filtered_args.append(arg)
                     filtered_args.append(hw_encoder)
+                    if hw_accel == "qsv":
+                        if settings.qsv_low_power:
+                            filtered_args.extend(["-low_power", "1"])
+                        filtered_args.extend(["-async_depth", "1"])
+                    elif hw_accel == "nvenc":
+                        filtered_args.extend(["-tune", settings.nvenc_tune])
                     skip_next = True
                     continue
 
@@ -478,18 +525,30 @@ class FFmpegTranscoder:
                     break
             filtered_args.append(arg)
 
-        # Inject hardware acceleration init args before -i, but only if no
-        # software-space -vf filters exist (they'd conflict with hwaccel output format).
-        has_vf = any(a == "-vf" for a in filtered_args)
-        if needs_hw_replace and not has_vf:
+        # Inject hardware acceleration init args before -i.
+        # Always inject HW decode (massive speed win). Only add -hwaccel_output_format
+        # when no actual software filters exist (they need frames in system memory).
+        if needs_hw_replace:
+            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload")
+            has_sw_filter = False
+            for idx, a in enumerate(filtered_args):
+                if a in ("-vf", "-filter_complex") and idx + 1 < len(filtered_args):
+                    fval = filtered_args[idx + 1]
+                    if not any(kw in fval for kw in hw_filter_keywords):
+                        has_sw_filter = True
+                        break
             hwaccel_args = []
             if hw_accel == "qsv":
                 hwaccel_args = ["-hwaccel", "qsv"]
                 if settings.qsv_device:
                     hwaccel_args.extend(["-qsv_device", settings.qsv_device])
-                hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
+                if not has_sw_filter:
+                    hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
+                hwaccel_args.extend(["-extra_hw_frames", "8"])
             elif hw_accel == "nvenc":
-                hwaccel_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+                hwaccel_args = ["-hwaccel", "cuda"]
+                if not has_sw_filter:
+                    hwaccel_args.extend(["-hwaccel_output_format", "cuda"])
             elif hw_accel == "vaapi":
                 device = settings.qsv_device or "/dev/dri/renderD128"
                 hwaccel_args = ["-hwaccel", "vaapi", "-vaapi_device", device]

@@ -38,20 +38,28 @@ class WorkerSettings(BaseSettings):
         description="QSV device path (e.g., /dev/dri/renderD128 on Linux)"
     )
     qsv_preset: str = Field(
-        default="fast",
+        default="veryfast",
         description="QSV encoding preset"
     )
     qsv_quality: int = Field(
-        default=23,
+        default=25,
         ge=1,
         le=51,
         description="QSV global quality (lower = better)"
     )
+    qsv_low_power: bool = Field(
+        default=True,
+        description="Use VDBOX fixed-function encode (faster, ~same quality)"
+    )
 
     # NVIDIA specific settings
     nvenc_preset: str = Field(
-        default="p4",
+        default="p1",
         description="NVENC preset (p1-p7, p1=fastest)"
+    )
+    nvenc_tune: str = Field(
+        default="ull",
+        description="NVENC tuning: hq, ll (low latency), ull (ultra-low latency)"
     )
     nvenc_gpu: int = Field(
         default=0,
