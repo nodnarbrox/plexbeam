@@ -28,6 +28,7 @@ INSTALL_WATCHDOG=true
 REMOTE_WORKER_URL=""
 REMOTE_API_KEY=""
 SHARED_SEGMENT_DIR=""
+CALLBACK_URL=""
 SERVER_TYPE=""  # auto-detect if not specified
 
 # Parse args
@@ -51,6 +52,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --shared-dir)
             SHARED_SEGMENT_DIR="$2"
+            shift 2
+            ;;
+        --callback-url)
+            CALLBACK_URL="$2"
             shift 2
             ;;
         --repo)
@@ -333,6 +338,7 @@ if [[ "$SERVER_TYPE" == "plex" ]]; then
         -e "s|__REMOTE_WORKER_URL__|${REMOTE_WORKER_URL}|g" \
         -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
         -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
+        -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
         "${CARTRIDGE_HOME}/cartridge.sh" > "$TRANSCODER_PATH"
 
     chmod 755 "$TRANSCODER_PATH"
@@ -357,6 +363,7 @@ else
         -e "s|__REMOTE_WORKER_URL__|${REMOTE_WORKER_URL}|g" \
         -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
         -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
+        -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
         "${CARTRIDGE_HOME}/cartridge.sh" > "$SHIM_PATH"
 
     chmod 755 "$SHIM_PATH"
@@ -410,6 +417,7 @@ PLEX_VERSION=${PLEX_VERSION}
 REMOTE_WORKER_URL=${REMOTE_WORKER_URL}
 REMOTE_API_KEY=${REMOTE_API_KEY}
 SHARED_SEGMENT_DIR=${SHARED_SEGMENT_DIR}
+CALLBACK_URL=${CALLBACK_URL}
 EOF
 
 echo -e "  ${GREEN}✓${RESET} Metadata saved"

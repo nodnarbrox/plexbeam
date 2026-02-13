@@ -58,6 +58,7 @@ class TranscodeJob:
     segment_duration: int = 4
     raw_args: list[str] = field(default_factory=list)
     source: str = "plex"  # "plex" or "jellyfin"
+    callback_url: Optional[str] = None  # URL to reach media server from worker (beam mode)
 
     # Runtime state
     process: Optional[asyncio.subprocess.Process] = None
@@ -216,7 +217,9 @@ class FFmpegTranscoder:
             cmd.extend([
                 "-preset", settings.nvenc_preset,
                 "-tune", settings.nvenc_tune,
-                "-cq", str(job.quality),
+                "-rc", "constqp", "-qp", str(job.quality),
+                "-rc-lookahead", "0", "-delay", "0",
+                "-bf", "0", "-multipass", "disabled",
             ])
             if job.video_bitrate:
                 cmd.extend(["-b:v", job.video_bitrate])
@@ -325,7 +328,7 @@ class FFmpegTranscoder:
 
         return encoders.get(hw_accel, encoders["none"])
 
-    def _filter_plex_args(self, job_id: str, raw_args: list[str], hw_accel: str, hw_encoder: str) -> list[str]:
+    def _filter_plex_args(self, job_id: str, raw_args: list[str], hw_accel: str, hw_encoder: str, callback_url: str = None, beam_stream: bool = False) -> list[str]:
         """
         Filter Plex-specific FFmpeg options from raw args.
 
@@ -336,12 +339,29 @@ class FFmpegTranscoder:
         """
         path_mappings = settings.get_path_mappings()
 
-        # Plex-specific options to strip (only options that standard ffmpeg
-        # doesn't understand).  Keep DASH muxer options like -manifest_name,
-        # -delete_removed, -skip_to_segment — they're valid ffmpeg options and
-        # -manifest_name is how Plex learns segments are ready.
+        # Beam mode: streaming pipe or uploaded file (no shared filesystem)
+        uploaded_input = settings.temp_dir / job_id / "input"
+        beam_mode = beam_stream or uploaded_input.exists()
+        beam_output_dir = settings.temp_dir / job_id if beam_mode else None
+        if beam_mode:
+            logger.info(f"[{job_id}] BEAM MODE: {'stream pipe' if beam_stream else 'uploaded file'}")
+
+        # Plex-specific options to strip.  Includes options that older ffmpeg
+        # (4.x on M40) doesn't understand.  In beam mode the cartridge
+        # downloads segments directly, so -manifest_name isn't needed.
         plex_opts_with_value = {
             "-loglevel_plex", "-progressurl", "-loglevel", "-time_delta",
+            # DASH muxer options not in ffmpeg 4.x
+            "-delete_removed", "-skip_to_segment", "-manifest_name",
+            # Strip Plex's custom DASH naming — we use ffmpeg defaults so the
+            # cartridge can reliably map filenames to Plex's expected structure
+            "-init_seg_name", "-media_seg_name",
+            # Strip window_size — beam mode needs ALL segments available for download
+            "-window_size",
+            # -fps_mode added in ffmpeg 5.0 (replaces -vsync)
+            "-fps_mode",
+            # Strip Plex's probe/seg settings — we inject our own optimized values
+            "-probesize", "-analyzeduration", "-seg_duration",
             # Linux VAAPI options
             "-hwaccel", "-hwaccel:0", "-hwaccel_device", "-hwaccel_device:0",
             "-init_hw_device", "-filter_hw_device"
@@ -375,6 +395,12 @@ class FFmpegTranscoder:
                     else:
                         logger.warning(f"[{job_id}] Could not extract output label from filter!")
 
+        # When using pipe:0 (beam_stream), collect any -ss before -i and defer it
+        # to AFTER -i.  Input seeking on a pipe requires linearly reading+discarding
+        # the entire MKV up to the seek point, which is extremely slow and error-prone.
+        # Output seeking (after -i) decodes and discards — slower but reliable for pipes.
+        deferred_ss = None  # (flag, value) to inject after -i when beam_stream
+
         filtered_args = []
         skip_next = False
         seen_input = False
@@ -384,6 +410,25 @@ class FFmpegTranscoder:
                 continue
             if arg == "-i":
                 seen_input = True
+                # Beam mode: replace input path
+                if beam_mode and i + 1 < len(raw_args):
+                    filtered_args.append("-i")
+                    if beam_stream:
+                        filtered_args.append("pipe:0")
+                    else:
+                        filtered_args.append(str(uploaded_input))
+                    # Inject deferred -ss after -i for pipe seeking
+                    if deferred_ss is not None:
+                        filtered_args.extend(["-ss", deferred_ss])
+                        logger.info(f"[{job_id}] BEAM: moved -ss {deferred_ss} after -i (output seeking for pipe)")
+                        deferred_ss = None
+                    skip_next = True
+                    continue
+            # When beam_stream + -ss before -i: defer it to after -i
+            if beam_stream and not seen_input and arg == "-ss" and i + 1 < len(raw_args):
+                deferred_ss = raw_args[i + 1]
+                skip_next = True
+                continue
             # Strip input decoder specs before -i when hwaccel is enabled.
             # -codec:0 hevc forces CPU decoder, blocking QSV/CUDA auto-selection.
             if not seen_input and hw_accel != "none" and re.match(r'-codec:\d+$', arg):
@@ -405,7 +450,10 @@ class FFmpegTranscoder:
                 elif hw_accel == "qsv":
                     scale_filter = "scale_qsv=w=1920:h=-1:format=nv12"
                 elif hw_accel == "nvenc":
-                    scale_filter = "scale_cuda=1920:-1:format=nv12"
+                    # CPU decode + SW scale + hwupload → NVENC encode
+                    # (M40/GM200 lacks HEVC Main10 CUVID decode, so use CPU decode
+                    # and format=nv12 to convert 10-bit→8-bit for h264_nvenc)
+                    scale_filter = "scale=1920:-2:flags=fast_bilinear:sws_dither=none,format=nv12,hwupload_cuda"
                 else:
                     scale_filter = "scale=1920:-2"
                 encoder_opts = ["-c:v", hw_encoder]
@@ -417,14 +465,43 @@ class FFmpegTranscoder:
                         "-low_power", "1", "-async_depth", "1",
                     ])
                 elif hw_accel == "nvenc":
-                    encoder_opts.extend(["-preset", "p1", "-tune", "ull", "-cq", "25"])
+                    if beam_mode and settings.beam_max_bitrate:
+                        # Beam mode: CBR for strict bitrate enforcement on WiFi.
+                        # NVENC VBR doesn't properly enforce maxrate on older FFmpeg (4.x).
+                        # CBR produces predictable segment sizes for reliable downloads.
+                        # -forced-idr 1: NVENC ignores -force_key_frames without this
+                        # -g 24: 1s GOP at 24fps — small segments for pipelined HTTP
+                        encoder_opts.extend([
+                            "-preset", "p1", "-tune", "ull",
+                            "-rc", "cbr", "-b:v", settings.beam_max_bitrate,
+                            "-rc-lookahead", "0", "-delay", "0",
+                            "-bf", "0", "-multipass", "disabled",
+                            "-forced-idr", "1", "-g", "24",
+                        ])
+                    else:
+                        encoder_opts.extend([
+                            "-preset", "p1", "-tune", "ull",
+                            "-rc", "constqp", "-qp", "25",
+                            "-rc-lookahead", "0", "-delay", "0",
+                            "-bf", "0", "-multipass", "disabled",
+                        ])
                 elif hw_accel == "none":
                     encoder_opts.extend(["-preset", "veryfast", "-crf", "25"])
-                filtered_args.extend([
-                    "-vf", scale_filter,
-                    *encoder_opts,
-                    "-maxrate", "10M", "-bufsize", "5M"
-                ])
+                # Beam mode: cap bitrate for bandwidth-limited networks
+                if beam_mode and settings.beam_max_bitrate:
+                    # CBR already enforces; maxrate/bufsize as safety net
+                    filtered_args.extend([
+                        "-vf", scale_filter,
+                        *encoder_opts,
+                        "-maxrate", settings.beam_max_bitrate,
+                        "-bufsize", settings.beam_max_bitrate
+                    ])
+                else:
+                    filtered_args.extend([
+                        "-vf", scale_filter,
+                        *encoder_opts,
+                        "-maxrate", "10M", "-bufsize", "5M"
+                    ])
                 skip_next = True
                 continue
             # Skip high bitrate settings from Plex (we use our own lower limits)
@@ -481,19 +558,47 @@ class FFmpegTranscoder:
             # Replace HLS VOD mode with event mode (Windows m3u8 flush issue)
             if arg == "vod" and i > 0 and raw_args[i - 1] == "-hls_playlist_type":
                 arg = "event"
-            # Apply all path mappings (longest prefix first)
-            for frm, to in path_mappings:
-                if arg.startswith(frm):
-                    arg = to + arg[len(frm):]
-                    break
+            # Apply all path mappings (longest prefix first) — skip in beam mode
+            if not beam_mode:
+                for frm, to in path_mappings:
+                    if arg.startswith(frm):
+                        arg = to + arg[len(frm):]
+                        break
             filtered_args.append(arg)
+
+        # Beam mode: redirect output path to worker temp dir
+        if beam_mode and beam_output_dir and filtered_args:
+            beam_output_dir.mkdir(parents=True, exist_ok=True)
+            last = filtered_args[-1]
+            if os.path.isabs(last) or last in ("dash", "hls"):
+                name = Path(last).name
+                # Plex passes bare "dash" as output — give it a proper .mpd extension
+                if name == "dash":
+                    name = "output.mpd"
+                elif name == "hls":
+                    name = "output.m3u8"
+                filtered_args[-1] = str(beam_output_dir / name)
+                logger.info(f"[{job_id}] BEAM: output redirected to {filtered_args[-1]}")
+
+        # Beam mode: inject low-latency DASH muxer args for faster first-segment
+        if beam_mode and filtered_args:
+            output_path = filtered_args[-1]
+            is_dash = output_path.endswith(".mpd") or (
+                "-f" in filtered_args and filtered_args[filtered_args.index("-f") + 1] == "dash"
+            ) if "-f" in filtered_args else output_path.endswith(".mpd")
+            if is_dash:
+                # Shorter segments + sub-segment fragments = faster time-to-first-frame
+                dash_args = ["-seg_duration", "1"]
+                # Insert before the output path (last arg)
+                filtered_args[-1:] = dash_args + [filtered_args[-1]]
+                logger.info(f"[{job_id}] BEAM: injected low-latency DASH args (1s segments)")
 
         # Inject hardware acceleration args before -i for ALL hw_accel types
         # HW decode is the #1 speed win — 4K HEVC decode on CPU is the bottleneck
         if needs_hw_replace:
             # Check for SW video filters (only -vf, not -filter_complex which is often audio).
             # HW scale filters (scale_qsv, scale_cuda) need hwaccel_output_format.
-            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload")
+            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload", "hwupload_cuda")
             has_sw_vf = False
             for idx, a in enumerate(filtered_args):
                 if a == "-vf" and idx + 1 < len(filtered_args):
@@ -511,9 +616,9 @@ class FFmpegTranscoder:
                     hwaccel_args.extend(["-hwaccel_output_format", "qsv"])
                 hwaccel_args.extend(["-extra_hw_frames", "8"])
             elif hw_accel == "nvenc":
-                hwaccel_args = ["-hwaccel", "cuda"]
-                if not has_sw_vf:
-                    hwaccel_args.extend(["-hwaccel_output_format", "cuda"])
+                # No hwaccel injection — CPU decode + hwupload_cuda in -vf handles it.
+                # M40/GM200 can't CUVID-decode HEVC Main 10 (10-bit).
+                pass
             elif hw_accel == "vaapi":
                 # NOTE: Do NOT use -hwaccel_output_format vaapi — VGEM in WSL2 doesn't
                 # support KMS dumb buffer allocation. Decode on CPU, use hwupload in -vf.
@@ -528,7 +633,7 @@ class FFmpegTranscoder:
 
         return filtered_args
 
-    def _filter_standard_args(self, raw_args: list[str]) -> list[str]:
+    def _filter_standard_args(self, raw_args: list[str], job_id: str = None, callback_url: str = None, beam_stream: bool = False) -> list[str]:
         """
         Filter standard ffmpeg args (e.g., Jellyfin) for GPU worker execution.
 
@@ -538,6 +643,13 @@ class FFmpegTranscoder:
         path_mappings = settings.get_path_mappings()
         hw_accel = settings.hw_accel
         hw_encoder = settings.get_video_encoder()
+
+        # Beam mode: streaming pipe or uploaded file (no shared filesystem)
+        uploaded_input = settings.temp_dir / job_id / "input" if job_id else None
+        beam_mode = beam_stream or (uploaded_input is not None and uploaded_input.exists())
+        beam_output_dir = settings.temp_dir / job_id if beam_mode else None
+        if beam_mode:
+            logger.info(f"[{job_id}] BEAM MODE (standard): {'stream pipe' if beam_stream else 'uploaded file'}")
 
         # Check if software encoding is requested (we'll replace with HW encoder)
         needs_hw_replace = hw_accel != "none" and any(
@@ -559,6 +671,16 @@ class FFmpegTranscoder:
                 arg = arg[6:-1]
             elif arg.startswith("file:"):
                 arg = arg[5:]
+
+            # Beam mode: replace input path
+            if beam_mode and arg == "-i" and i + 1 < len(raw_args):
+                filtered_args.append("-i")
+                if beam_stream:
+                    filtered_args.append("pipe:0")
+                else:
+                    filtered_args.append(str(uploaded_input))
+                skip_next = True
+                continue
 
             # Convert Jellyfin's SW video filters to GPU equivalents
             if arg == "-vf" and i + 1 < len(raw_args) and needs_hw_replace:
@@ -622,18 +744,43 @@ class FFmpegTranscoder:
             if arg == "vod" and i > 0 and raw_args[i - 1] == "-hls_playlist_type":
                 arg = "event"
 
-            # Apply all path mappings (longest prefix first)
-            for frm, to in path_mappings:
-                if arg.startswith(frm):
-                    arg = to + arg[len(frm):]
-                    break
+            # Apply all path mappings (longest prefix first) — skip in beam mode
+            if not beam_mode:
+                for frm, to in path_mappings:
+                    if arg.startswith(frm):
+                        arg = to + arg[len(frm):]
+                        break
             filtered_args.append(arg)
+
+        # Beam mode: redirect output path to worker temp dir
+        if beam_mode and beam_output_dir and filtered_args:
+            beam_output_dir.mkdir(parents=True, exist_ok=True)
+            last = filtered_args[-1]
+            if os.path.isabs(last) or last in ("dash", "hls"):
+                name = Path(last).name
+                if name == "dash":
+                    name = "output.mpd"
+                elif name == "hls":
+                    name = "output.m3u8"
+                filtered_args[-1] = str(beam_output_dir / name)
+                logger.info(f"[{job_id}] BEAM: output redirected to {filtered_args[-1]}")
+
+        # Beam mode: inject low-latency DASH muxer args for faster first-segment
+        if beam_mode and filtered_args:
+            output_path = filtered_args[-1]
+            is_dash = output_path.endswith(".mpd") or (
+                "-f" in filtered_args and filtered_args[filtered_args.index("-f") + 1] == "dash"
+            ) if "-f" in filtered_args else output_path.endswith(".mpd")
+            if is_dash:
+                dash_args = ["-seg_duration", "1"]
+                filtered_args[-1:] = dash_args + [filtered_args[-1]]
+                logger.info(f"[{job_id}] BEAM: injected low-latency DASH args (1s segments)")
 
         # Inject hardware acceleration init args before -i.
         # Only inject when no software filters exist — QSV decode to system memory
         # fails on some platforms (Windows) when combined with SW -vf filters.
         if needs_hw_replace:
-            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload")
+            hw_filter_keywords = ("scale_qsv", "scale_cuda", "scale_vaapi", "hwupload", "hwupload_cuda")
             has_sw_filter = False
             for idx, a in enumerate(filtered_args):
                 if a in ("-vf", "-filter_complex") and idx + 1 < len(filtered_args):
@@ -675,6 +822,8 @@ class FFmpegTranscoder:
         use_raw = job.raw_args and (job.source != "plex" or not job.output_path or job.output_path == "")
         if use_raw:
             cmd = [self.ffmpeg_path, "-y", "-nostdin"]
+            # Maximize CPU decode parallelism
+            cmd.extend(["-threads", "0", "-thread_type", "frame"])
             # Add progress reporting
             cmd.extend(["-progress", "pipe:1", "-stats_period", "0.5"])
 
@@ -682,9 +831,9 @@ class FFmpegTranscoder:
             hw_encoder = settings.get_video_encoder()
 
             if job.source == "plex":
-                filtered_args = self._filter_plex_args(job.job_id, job.raw_args, hw_accel, hw_encoder)
+                filtered_args = self._filter_plex_args(job.job_id, job.raw_args, hw_accel, hw_encoder, callback_url=job.callback_url)
             else:
-                filtered_args = self._filter_standard_args(job.raw_args)
+                filtered_args = self._filter_standard_args(job.raw_args, job_id=job.job_id, callback_url=job.callback_url)
 
             # Add error-level logging so we can see failures
             cmd.extend(["-loglevel", "error"])
@@ -808,6 +957,64 @@ class FFmpegTranscoder:
                     progress.progress = 100.0
                     progress.status = "completed"
         except (ValueError, IndexError):
+            pass
+
+    def build_beam_stream_command(self, job: TranscodeJob) -> list[str]:
+        """Build ffmpeg command for beam streaming (input from stdin pipe)."""
+        cmd = [self.ffmpeg_path, "-y"]
+        # Maximize CPU decode parallelism (4K HEVC decode is the bottleneck)
+        cmd.extend(["-threads", "0", "-thread_type", "frame"])
+        # Minimal probe for fastest pipe startup (MKV header is <10KB, 50KB is plenty)
+        # analyzeduration=0: trust container headers, don't buffer input
+        cmd.extend(["-probesize", "50000", "-analyzeduration", "0"])
+        cmd.extend(["-progress", "pipe:1", "-stats_period", "0.5"])
+
+        hw_accel = settings.hw_accel
+        hw_encoder = settings.get_video_encoder()
+
+        # Filter args with beam_stream=True (replaces -i path with pipe:0)
+        if job.source == "plex":
+            filtered = self._filter_plex_args(
+                job.job_id, job.raw_args, hw_accel, hw_encoder,
+                callback_url=job.callback_url, beam_stream=True
+            )
+        else:
+            filtered = self._filter_standard_args(
+                job.raw_args, job_id=job.job_id,
+                callback_url=job.callback_url, beam_stream=True
+            )
+
+        cmd.extend(["-loglevel", "error"])
+
+        # Handle relative output paths (same as transcode())
+        if filtered:
+            last_arg = filtered[-1]
+            if last_arg in ("dash", "hls"):
+                output_dir = settings.temp_dir / job.job_id
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if last_arg == "dash":
+                    filtered[-1] = str(output_dir / "output.mpd")
+                else:
+                    filtered[-1] = str(output_dir / "output.m3u8")
+            elif os.path.isabs(last_arg) or (len(last_arg) > 2 and last_arg[1] == ':'):
+                Path(last_arg).parent.mkdir(parents=True, exist_ok=True)
+
+        cmd.extend(filtered)
+        return cmd
+
+    async def read_beam_progress(self, job: TranscodeJob) -> None:
+        """Read and update progress from ffmpeg stdout (progress pipe)."""
+        if not job.process or not job.process.stdout:
+            return
+
+        buffer = ""
+        try:
+            async for line in job.process.stdout:
+                buffer += line.decode()
+                while "\n" in buffer:
+                    line_str, buffer = buffer.split("\n", 1)
+                    self._update_progress_from_line(job.progress, line_str)
+        except Exception:
             pass
 
     async def cancel(self, job: TranscodeJob) -> None:

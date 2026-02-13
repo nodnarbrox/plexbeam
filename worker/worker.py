@@ -7,6 +7,7 @@ using hardware-accelerated FFmpeg.
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -51,6 +52,7 @@ class TranscodeRequest(BaseModel):
     callback_url: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
     source: str = Field(default="plex", description="Source server type (plex or jellyfin)")
+    beam_stream: bool = Field(default=False, description="If true, input will be streamed via /beam/stream endpoint")
 
 
 class TranscodeResponse(BaseModel):
@@ -100,6 +102,7 @@ class JobQueue:
         self.websocket_connections: dict[str, list[WebSocket]] = {}
         self.last_polled: dict[str, float] = {}  # job_id -> timestamp
         self._reaper_task: Optional[asyncio.Task] = None
+        self._cleaner_task: Optional[asyncio.Task] = None
 
     async def start_workers(self):
         """Start background worker tasks."""
@@ -107,12 +110,15 @@ class JobQueue:
             task = asyncio.create_task(self._worker(i))
             self.workers.append(task)
         self._reaper_task = asyncio.create_task(self._orphan_reaper())
+        self._cleaner_task = asyncio.create_task(self._temp_cleaner())
         logger.info(f"Started {settings.max_concurrent_jobs} worker(s)")
 
     async def stop_workers(self):
         """Stop all worker tasks."""
         if self._reaper_task:
             self._reaper_task.cancel()
+        if self._cleaner_task:
+            self._cleaner_task.cancel()
         for task in self.workers:
             task.cancel()
         await asyncio.gather(*self.workers, return_exceptions=True)
@@ -155,16 +161,18 @@ class JobQueue:
                 break
 
     async def _orphan_reaper(self):
-        """Cancel running jobs that haven't been polled for 30+ seconds.
+        """Cancel running jobs that haven't been polled for 90+ seconds.
         Handles the case where Jellyfin/Plex kills the cartridge (SIGKILL)
-        without sending a cancel request to the worker."""
+        without sending a cancel request to the worker.
+        Timeout is generous to allow for pipe-based seeking (beam_stream)
+        where ffmpeg may need 60+ seconds to seek through a pipe."""
         while True:
             try:
                 await asyncio.sleep(15)
                 now = time.time()
                 for job_id in list(self.active_jobs):
                     last = self.last_polled.get(job_id)
-                    if last is not None and (now - last) > 30:
+                    if last is not None and (now - last) > 90:
                         logger.info(f"Orphan reaper: cancelling stale job {job_id} "
                                     f"(no poll for {now - last:.0f}s)")
                         await self.cancel_job(job_id)
@@ -173,6 +181,43 @@ class JobQueue:
                 break
             except Exception as e:
                 logger.error(f"Orphan reaper error: {e}")
+
+    async def _temp_cleaner(self):
+        """Periodically clean up temp dirs for finished jobs and stale dirs.
+
+        - Completed/failed/cancelled jobs: cleaned 60s after finishing
+        - Stale dirs with no matching job: cleaned after cleanup_temp_after_hours
+        """
+        while True:
+            try:
+                await asyncio.sleep(60)
+                now = time.time()
+                max_age = settings.cleanup_temp_after_hours * 3600
+
+                # Clean finished job dirs (wait 60s so cartridge can download remaining segments)
+                for job_id, job in list(self.jobs.items()):
+                    if job.progress.status in ("completed", "failed", "cancelled"):
+                        if job.completed_at and (now - job.completed_at.timestamp()) > 60:
+                            job_dir = settings.temp_dir / job_id
+                            if job_dir.exists():
+                                shutil.rmtree(job_dir, ignore_errors=True)
+                                logger.info(f"Temp cleaner: removed {job_dir}")
+                            del self.jobs[job_id]
+                            self.last_polled.pop(job_id, None)
+
+                # Sweep orphan dirs that have no matching job (old crashes, etc.)
+                if settings.temp_dir.exists():
+                    for entry in settings.temp_dir.iterdir():
+                        if entry.is_dir() and entry.name not in self.jobs:
+                            age = now - entry.stat().st_mtime
+                            if age > max_age:
+                                shutil.rmtree(entry, ignore_errors=True)
+                                logger.info(f"Temp cleaner: swept stale dir {entry.name} "
+                                            f"(age: {age/3600:.1f}h)")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Temp cleaner error: {e}")
 
     def record_poll(self, job_id: str):
         """Record that a client polled for this job's status."""
@@ -382,10 +427,21 @@ async def create_transcode_job(
         output_type=output_type,
         segment_duration=output_spec.get("segment_duration", 4),
         raw_args=args.get("raw_args", []),
-        source=source
+        source=source,
+        callback_url=request.callback_url
     )
 
-    # Submit to queue
+    # Submit to queue (unless beam_stream — the /beam/stream endpoint will run it)
+    if request.beam_stream:
+        job_queue.jobs[job.job_id] = job
+        job.progress.status = "pending"
+        logger.info(f"Job {job.job_id} registered for beam streaming (not enqueued)")
+        return TranscodeResponse(
+            job_id=job.job_id,
+            status="pending",
+            message=f"Job registered for beam streaming. Stream to /beam/stream/{job.job_id}"
+        )
+
     await job_queue.submit_job(job)
 
     return TranscodeResponse(
@@ -907,6 +963,164 @@ async def get_segment(job_id: str, filename: str):
 
 
 # ============================================================================
+# Beam Mode Endpoints (file upload/download for remote workers)
+# ============================================================================
+
+@app.post("/beam/stream/{job_id}")
+async def beam_stream(job_id: str, request: Request):
+    """Stream input directly into ffmpeg stdin for real-time transcoding.
+
+    The cartridge POSTs the input file body while ffmpeg processes it
+    concurrently.  Transcoding starts as soon as the first bytes arrive —
+    no waiting for the full upload.
+    """
+    job = job_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Build ffmpeg command with pipe:0 input
+    cmd = transcoder.build_beam_stream_command(job)
+    logger.info(f"[{job_id}] Beam stream command: {' '.join(cmd)}")
+
+    # Start ffmpeg with stdin pipe
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    # Increase write buffer limits for smoother throughput (2MB high / 512KB low)
+    transport = process.stdin.transport
+    transport.set_write_buffer_limits(high=2097152, low=524288)
+
+    # Increase OS pipe buffer from 64KB default to 1MB (Linux only)
+    try:
+        import fcntl
+        pipe_fd = transport._pipe.fileno()
+        fcntl.fcntl(pipe_fd, 1031, 1048576)  # F_SETPIPE_SZ = 1031
+        logger.debug(f"[{job_id}] Pipe buffer increased to 1MB")
+    except (ImportError, OSError, AttributeError):
+        pass  # Windows or unsupported — silently skip
+
+    job.process = process
+    job.started_at = datetime.now()
+    job.progress.status = "running"
+    job_queue.active_jobs.add(job_id)
+
+    # Background: read progress from ffmpeg stdout
+    progress_task = asyncio.create_task(
+        transcoder.read_beam_progress(job)
+    )
+
+    # Stream HTTP body → ffmpeg stdin (batched drain for throughput)
+    total = 0
+    bytes_since_drain = 0
+    DRAIN_EVERY = 524288  # Drain every 512KB instead of every chunk
+    try:
+        async for chunk in request.stream():
+            if process.returncode is not None:
+                break  # ffmpeg exited early
+            process.stdin.write(chunk)
+            bytes_since_drain += len(chunk)
+            total += len(chunk)
+            # Batch drain: only apply backpressure every 512KB
+            if bytes_since_drain >= DRAIN_EVERY:
+                await process.stdin.drain()
+                bytes_since_drain = 0
+        # Final drain + signal EOF to ffmpeg
+        if process.stdin and not process.stdin.is_closing():
+            await process.stdin.drain()
+            process.stdin.close()
+            await process.stdin.wait_closed()
+    except (BrokenPipeError, ConnectionResetError) as e:
+        logger.warning(f"[{job_id}] Beam stream pipe broken: {e}")
+    except Exception as e:
+        logger.error(f"[{job_id}] Beam stream error: {e}")
+        if process.returncode is None:
+            process.terminate()
+        job.progress.status = "failed"
+        job.progress.error = str(e)
+        job_queue.active_jobs.discard(job_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Wait for progress reader to finish (reads stdout until EOF)
+    await progress_task
+
+    # Read stderr and wait for process exit
+    stderr_data = b""
+    if process.stderr:
+        stderr_data = await process.stderr.read()
+    await process.wait()
+
+    job.completed_at = datetime.now()
+    job_queue.active_jobs.discard(job_id)
+
+    if process.returncode == 0:
+        job.progress.status = "completed"
+        job.progress.progress = 100.0
+        logger.info(f"[{job_id}] Beam stream completed: {total / (1024*1024):.1f} MB streamed")
+    else:
+        job.progress.status = "failed"
+        job.progress.error = stderr_data.decode()[-500:]
+        logger.error(f"[{job_id}] Beam stream failed: {job.progress.error}")
+
+    return {"status": job.progress.status, "bytes_streamed": total}
+
+
+@app.put("/beam/upload/{job_id}")
+async def beam_upload(job_id: str, request: Request):
+    """Receive input file from cartridge, save to worker temp storage.
+
+    Used in beam mode where the worker has no shared filesystem with the
+    media server. The cartridge uploads the input file before submitting
+    the transcode job.
+    """
+    import aiofiles
+
+    upload_dir = settings.temp_dir / job_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    input_path = upload_dir / "input"
+
+    total_bytes = 0
+    async with aiofiles.open(input_path, "wb") as f:
+        async for chunk in request.stream():
+            await f.write(chunk)
+            total_bytes += len(chunk)
+
+    logger.info(f"[{job_id}] Beam upload complete: {total_bytes / (1024*1024):.1f} MB")
+    return {"status": "uploaded", "path": str(input_path), "job_id": job_id, "size": total_bytes}
+
+
+@app.get("/beam/segments/{job_id}")
+async def beam_list_segments(job_id: str):
+    """List output files available for download.
+
+    Returns all files in the job's temp directory except the uploaded
+    input file. Used by the cartridge to progressively download segments
+    as they become available during transcoding.
+    """
+    output_dir = settings.temp_dir / job_id
+    if not output_dir.exists():
+        return {"files": []}
+    files = [f.name for f in output_dir.iterdir()
+             if f.is_file() and f.name != "input" and not f.name.endswith(".tmp")]
+    return {"files": sorted(files)}
+
+
+@app.get("/beam/segment/{job_id}/{filename}")
+async def beam_get_segment(job_id: str, filename: str):
+    """Serve a specific output file (segment, manifest, init, etc.)."""
+    # Sanitize filename to prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = settings.temp_dir / job_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Segment not found")
+    return FileResponse(path)
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -920,6 +1134,7 @@ def main():
         port=settings.port,
         workers=settings.workers,
         log_level=settings.log_level.lower(),
+        http="httptools",  # 4-5x faster HTTP parsing than h11
         reload=False
     )
 

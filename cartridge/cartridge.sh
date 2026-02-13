@@ -37,14 +37,26 @@ REMOTE_API_KEY="__REMOTE_API_KEY__"
 REMOTE_TIMEOUT=5                    # Seconds to wait for worker response
 FALLBACK_TO_LOCAL=true              # If true, use local transcoder on failure
 SHARED_SEGMENT_DIR="__SHARED_SEGMENT_DIR__"  # Where worker writes segments
+CALLBACK_URL="__CALLBACK_URL__"     # URL for worker to reach media server (beam mode manifest callbacks)
 
 # --- Runtime vars ------------------------------------------------------------
 SESSION_ID="$(date +%Y%m%d_%H%M%S)_$$"
 SESSION_DIR="${LOG_BASE}/sessions/${SESSION_ID}"
 DISPATCHED_TO_REMOTE=false
+STREAM_PID=""
+declare -A BEAM_DOWNLOADED=()  # Track which beam segments we've already downloaded
+MANIFEST_CALLBACK_URL=""       # Plex's -manifest_name callback URL (for registering DASH manifest)
+LAST_MANIFEST_HASH=""          # Track manifest changes for re-posting
+BEAM_MANIFEST_POSTED=false     # Track whether initial manifest has been posted (gate on segments existing)
+PROGRESS_URL=""                # Plex's -progressurl callback (keeps session alive)
 
 # --- Cleanup trap: cancel worker job when cartridge is killed ----------------
 _cleanup_remote() {
+    # Kill ALL background jobs (segment downloads, streaming curl, etc.)
+    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
+    if [[ -n "${STREAM_PID:-}" ]]; then
+        kill "$STREAM_PID" 2>/dev/null || true
+    fi
     if [[ "$DISPATCHED_TO_REMOTE" == "true" ]] && [[ -n "${REMOTE_WORKER_URL:-}" ]]; then
         curl -sf -X DELETE "${REMOTE_WORKER_URL}/job/${SESSION_ID}" &>/dev/null || true
     fi
@@ -149,6 +161,12 @@ for arg in "$@"; do
         -ss)
             SEEK_POSITION="$arg"
             ;;
+        -manifest_name)
+            MANIFEST_CALLBACK_URL="$arg"
+            ;;
+        -progressurl)
+            PROGRESS_URL="$arg"
+            ;;
     esac
 
     case "$arg" in
@@ -228,6 +246,129 @@ fi
     done
 } > "${SESSION_DIR}/00_session.log"
 
+# --- Beam segment download helper --------------------------------------------
+beam_download_segments() {
+    local worker_url="$1"
+    local target_dir="$2"
+
+    # List available segments from worker
+    local seg_list
+    seg_list=$(curl -sf --connect-timeout 2 "${worker_url}/beam/segments/${SESSION_ID}" 2>/dev/null || echo "")
+
+    if [[ -z "$seg_list" ]] || [[ "$seg_list" == '{"files":[]}' ]]; then
+        return
+    fi
+
+    # Parse segment filenames from JSON using jq
+    local seg_files
+    seg_files=$(echo "$seg_list" | jq -r '.files[]' 2>/dev/null) || return
+
+    # Separate into: manifest (always re-download), init, and media segments
+    local manifest_segs=()
+    local init_segs=()
+    local media_segs=()
+    for seg in $seg_files; do
+        if [[ "$seg" == *.mpd ]] || [[ "$seg" == *.m3u8 ]]; then
+            # Always re-download manifest (it updates as new segments appear)
+            manifest_segs+=("$seg")
+        elif [[ -z "${BEAM_DOWNLOADED[$seg]:-}" ]]; then
+            if [[ "$seg" == init-* ]]; then
+                init_segs+=("$seg")
+            else
+                media_segs+=("$seg")
+            fi
+        fi
+    done
+
+    # Sort media segments by segment NUMBER across streams so audio (stream1)
+    # and video (stream0) are interleaved: 0-00001, 1-00001, 0-00002, 1-00002...
+    # Without this, all stream0 segments download before any stream1, causing
+    # audio to lag far behind video.
+    if [[ ${#media_segs[@]} -gt 0 ]]; then
+        local sorted_segs
+        sorted_segs=$(printf '%s\n' "${media_segs[@]}" | sort -t'-' -k3,3n -k2,2)
+        media_segs=()
+        while IFS= read -r seg; do
+            media_segs+=("$seg")
+        done <<< "$sorted_segs"
+    fi
+
+    # Download manifest synchronously (small file, needed for POST below)
+    for seg in "${manifest_segs[@]}"; do
+        curl -sf --connect-timeout 2 --max-time 3 \
+            "${worker_url}/beam/segment/${SESSION_ID}/${seg}" \
+            -o "${target_dir}/${seg}" 2>/dev/null || true
+    done
+
+    # Download init segments SYNCHRONOUSLY (small files, must exist before manifest POST)
+    for seg in "${init_segs[@]}"; do
+        curl -sf "${worker_url}/beam/segment/${SESSION_ID}/${seg}" \
+            -o "${target_dir}/${seg}" 2>/dev/null || true
+        BEAM_DOWNLOADED[$seg]=1
+    done
+
+    # Download media segments.
+    # Before initial manifest POST: download synchronously so files exist when Plex
+    # tells the client about them. After manifest posted: background (non-blocking).
+    local started=0
+    for seg in "${media_segs[@]}"; do
+        if [[ $started -ge 8 ]]; then
+            break  # Download more on next poll cycle
+        fi
+        if [[ "$BEAM_MANIFEST_POSTED" == "false" ]]; then
+            # Synchronous: ensure segments exist on disk before we POST manifest
+            curl -sf "${worker_url}/beam/segment/${SESSION_ID}/${seg}" \
+                -o "${target_dir}/${seg}" 2>/dev/null || true
+        else
+            # Background: manifest already posted, don't block the poll loop
+            curl -sf "${worker_url}/beam/segment/${SESSION_ID}/${seg}" \
+                -o "${target_dir}/${seg}" 2>/dev/null &
+        fi
+        BEAM_DOWNLOADED[$seg]=1
+        started=$((started + 1))
+    done
+
+    # POST manifest to Plex's callback URL.
+    # CRITICAL: Only post AFTER init + media segments exist on disk.
+    # If we post early, Plex tells the client "segments ready" but files are 404.
+    if [[ -n "${MANIFEST_CALLBACK_URL:-}" ]] && [[ -f "${target_dir}/output.mpd" ]]; then
+        local should_post=false
+
+        if [[ "$BEAM_MANIFEST_POSTED" == "false" ]]; then
+            # First POST: gate on init + media segments existing in target dir
+            local has_init=false has_media=false
+            for f in "${target_dir}"/init-stream*.m4s; do
+                [[ -f "$f" ]] && has_init=true && break
+            done
+            for f in "${target_dir}"/chunk-stream*.m4s; do
+                [[ -f "$f" ]] && has_media=true && break
+            done
+            if [[ "$has_init" == "true" ]] && [[ "$has_media" == "true" ]]; then
+                should_post=true
+            fi
+        else
+            # Subsequent POSTs: manifest already registered, just update if changed
+            should_post=true
+        fi
+
+        if [[ "$should_post" == "true" ]]; then
+            local manifest_hash
+            manifest_hash=$(md5sum "${target_dir}/output.mpd" 2>/dev/null | cut -d' ' -f1)
+            if [[ "${manifest_hash}" != "${LAST_MANIFEST_HASH:-}" ]]; then
+                curl -sf -X POST \
+                    -H "Content-Type: application/dash+xml" \
+                    --data-binary @"${target_dir}/output.mpd" \
+                    "${MANIFEST_CALLBACK_URL}" 2>/dev/null || true
+                LAST_MANIFEST_HASH="${manifest_hash}"
+                if [[ "$BEAM_MANIFEST_POSTED" == "false" ]]; then
+                    log_event "BEAM" "Initial manifest posted (init + media segments ready in ${target_dir})"
+                    BEAM_MANIFEST_POSTED=true
+                fi
+            fi
+        fi
+    fi
+}
+
 # --- Remote dispatch function ------------------------------------------------
 dispatch_to_remote_worker() {
     local worker_url="${REMOTE_WORKER_URL}"
@@ -247,7 +388,12 @@ dispatch_to_remote_worker() {
 
     log_event "REMOTE" "Dispatching job ${SESSION_ID} to ${worker_url}"
 
-    # Build job JSON
+    # Build job JSON (beam_stream=true: worker won't enqueue, waits for /beam/stream)
+    local use_beam_stream=false
+    if [[ -n "$INPUT_FILE" ]] && [[ -f "$INPUT_FILE" ]]; then
+        use_beam_stream=true
+    fi
+
     local job_json
     job_json=$(cat << JOBEOF
 {
@@ -274,6 +420,8 @@ dispatch_to_remote_worker() {
         "raw_args": $(printf '%s\n' "${RAW_ARGS[@]}" | jq -R . | jq -s .)
     },
     "source": "${SERVER_TYPE}",
+    "beam_stream": ${use_beam_stream},
+    "callback_url": $(if [[ -n "$CALLBACK_URL" ]] && [[ "$CALLBACK_URL" != "__CALLBACK_URL__" ]]; then echo "\"${CALLBACK_URL}\""; else echo "null"; fi),
     "metadata": {
         "cartridge_version": "${CARTRIDGE_VERSION}",
         "session_id": "${SESSION_ID}"
@@ -311,16 +459,33 @@ JOBEOF
     local job_status
     job_status=$(echo "$response" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "")
 
-    if [[ "$job_status" == "queued" ]] || [[ "$job_status" == "running" ]]; then
+    if [[ "$job_status" == "queued" ]] || [[ "$job_status" == "running" ]] || [[ "$job_status" == "pending" ]]; then
         DISPATCHED_TO_REMOTE=true
         log_event "REMOTE" "Job ${SESSION_ID} submitted successfully (status: ${job_status})"
 
-        # Poll for completion
+        # Start streaming input file to worker in background (beam mode)
+        if [[ "$use_beam_stream" == "true" ]]; then
+            # Throttle upload to leave bandwidth for segment downloads.
+            # On WiFi (~16 Mbps), limiting upload to 1M leaves ~1 MB/s for downloads.
+            # Set PLEXBEAM_UPLOAD_RATE=0 to disable throttling (e.g., wired Ethernet).
+            local upload_rate="${PLEXBEAM_UPLOAD_RATE:-0}"
+            log_event "BEAM" "Streaming input: ${INPUT_FILE} (upload_rate=${upload_rate})"
+            curl -sf -X POST \
+                --connect-timeout "$REMOTE_TIMEOUT" \
+                --max-time 7200 \
+                --limit-rate "$upload_rate" \
+                -T "$INPUT_FILE" \
+                "${worker_url}/beam/stream/${SESSION_ID}" \
+                > "${SESSION_DIR}/01_beam_stream.json" 2>/dev/null &
+            STREAM_PID=$!
+        fi
+
+        # Poll for completion (0.25s interval for faster segment detection)
         local poll_count=0
-        local max_polls=7200  # 2 hours at 1 second intervals
+        local max_polls=28800  # 2 hours at 0.25 second intervals
 
         while [[ $poll_count -lt $max_polls ]]; do
-            sleep 1
+            sleep 0.25
             poll_count=$((poll_count + 1))
 
             local status_response
@@ -333,6 +498,16 @@ JOBEOF
                     completed)
                         log_event "REMOTE" "Job ${SESSION_ID} completed successfully"
                         echo "$status_response" > "${SESSION_DIR}/03_job_completed.json"
+                        # Download any remaining segments from worker
+                        if [[ -n "$OUTPUT_DIR" ]]; then
+                            beam_download_segments "$worker_url" "$OUTPUT_DIR"
+                            log_event "BEAM" "Final segment download: ${#BEAM_DOWNLOADED[@]} files"
+                        fi
+                        # Wait for streaming curl to finish
+                        if [[ -n "${STREAM_PID:-}" ]]; then
+                            wait "$STREAM_PID" 2>/dev/null || true
+                            STREAM_PID=""
+                        fi
                         # Final progress line so media server knows encoding finished
                         printf "frame=9999 fps=0.0 q=-1.0 size=N/A time=99:99:99.99 bitrate=N/A speed=0.0x\n" >&2
                         return 0
@@ -342,42 +517,74 @@ JOBEOF
                         error_msg=$(echo "$status_response" | grep -o '"error":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
                         log_event "REMOTE" "Job ${SESSION_ID} failed: ${error_msg}"
                         echo "$status_response" > "${SESSION_DIR}/03_job_failed.json"
+                        if [[ -n "${STREAM_PID:-}" ]]; then
+                            kill "$STREAM_PID" 2>/dev/null || true
+                            STREAM_PID=""
+                        fi
                         return 1
                         ;;
                     cancelled)
                         log_event "REMOTE" "Job ${SESSION_ID} was cancelled"
+                        if [[ -n "${STREAM_PID:-}" ]]; then
+                            kill "$STREAM_PID" 2>/dev/null || true
+                            STREAM_PID=""
+                        fi
                         return 1
                         ;;
                     running)
-                        # Emit ffmpeg-compatible progress on stderr so Jellyfin/Plex
-                        # TranscodeManager knows segments are ready to serve.
-                        local p_fps="" p_speed="" p_otms="" p_frame=""
-                        p_fps=$(echo "$status_response" | grep -o '"fps":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
-                        p_speed=$(echo "$status_response" | grep -o '"speed":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
-                        p_otms=$(echo "$status_response" | grep -o '"out_time_ms":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
-                        p_frame=$(echo "$status_response" | grep -o '"frame":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
-                        : "${p_fps:=0}" "${p_speed:=0}" "${p_otms:=0}" "${p_frame:=0}"
+                        # Emit ffmpeg-compatible progress on stderr every ~1s (every 4th poll)
+                        if [[ $((poll_count % 4)) -eq 0 ]]; then
+                            local p_fps="" p_speed="" p_otms="" p_frame=""
+                            p_fps=$(echo "$status_response" | grep -o '"fps":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
+                            p_speed=$(echo "$status_response" | grep -o '"speed":[0-9][0-9.]*' | head -1 | cut -d':' -f2) || true
+                            p_otms=$(echo "$status_response" | grep -o '"out_time_ms":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
+                            p_frame=$(echo "$status_response" | grep -o '"frame":[0-9][0-9]*' | head -1 | cut -d':' -f2) || true
+                            : "${p_fps:=0}" "${p_speed:=0}" "${p_otms:=0}" "${p_frame:=0}"
 
-                        # Convert out_time_ms (microseconds despite name) to HH:MM:SS.ff
-                        local ts=$((p_otms / 1000000))
-                        local time_str
-                        time_str=$(printf "%02d:%02d:%02d.%02d" \
-                            $((ts / 3600)) $(( (ts % 3600) / 60 )) $((ts % 60)) \
-                            $(( (p_otms % 1000000) / 10000 )) )
+                            # Convert out_time_ms (microseconds despite name) to HH:MM:SS.ff
+                            local ts=$((p_otms / 1000000))
+                            local time_str
+                            time_str=$(printf "%02d:%02d:%02d.%02d" \
+                                $((ts / 3600)) $(( (ts % 3600) / 60 )) $((ts % 60)) \
+                                $(( (p_otms % 1000000) / 10000 )) )
 
-                        printf "frame=%s fps=%s q=-1.0 size=N/A time=%s bitrate=N/A speed=%sx\n" \
-                            "$p_frame" "$p_fps" "$time_str" "$p_speed" >&2
+                            printf "frame=%s fps=%s q=-1.0 size=N/A time=%s bitrate=N/A speed=%sx\n" \
+                                "$p_frame" "$p_fps" "$time_str" "$p_speed" >&2
+
+                            # POST progress to Plex's -progressurl callback.
+                            # This keeps the transcode session alive — without it,
+                            # Plex times out and kills the session after ~60s.
+                            # Always POST even with out_time=0 (during seeks) to
+                            # prevent Plex from killing us while ffmpeg seeks.
+                            if [[ -n "${PROGRESS_URL:-}" ]]; then
+                                curl -sf -X POST \
+                                    --connect-timeout 1 --max-time 2 \
+                                    -d "frame=${p_frame}&fps=${p_fps}&speed=${p_speed}x&out_time_us=${p_otms}&progress=continue" \
+                                    "${PROGRESS_URL}" 2>/dev/null &
+                            fi
+                        fi
+
+                        # Beam mode: download segments progressively as they appear
+                        if [[ -n "$OUTPUT_DIR" ]]; then
+                            beam_download_segments "$worker_url" "$OUTPUT_DIR"
+                        fi
                         ;;
                 esac
 
                 # Log progress periodically
-                if [[ $((poll_count % 30)) -eq 0 ]]; then
+                if [[ $((poll_count % 120)) -eq 0 ]]; then
                     local progress
                     progress=$(echo "$status_response" | grep -o '"progress":[0-9.]*' | cut -d':' -f2 || echo "0")
                     log_event "REMOTE" "Job ${SESSION_ID} progress: ${progress}%"
                 fi
             fi
         done
+
+        # Wait for streaming curl to finish
+        if [[ -n "${STREAM_PID:-}" ]]; then
+            wait "$STREAM_PID" 2>/dev/null || true
+            STREAM_PID=""
+        fi
 
         log_event "REMOTE" "Job ${SESSION_ID} timed out after ${max_polls} seconds"
         return 1

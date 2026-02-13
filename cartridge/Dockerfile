@@ -50,4 +50,5 @@ RUN mkdir -p /var/log/plex-cartridge/sessions
 ENV PLEXBEAM_WORKER_URL="" \
     PLEXBEAM_API_KEY="" \
     PLEXBEAM_SHARED_SEGMENT_DIR="" \
-    PLEXBEAM_UPDATE_REPO="local"
+    PLEXBEAM_UPDATE_REPO="local" \
+    PLEXBEAM_CALLBACK_URL=""

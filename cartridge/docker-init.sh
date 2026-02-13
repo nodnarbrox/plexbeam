@@ -37,6 +37,7 @@ WORKER_URL="${PLEXBEAM_WORKER_URL:-}"
 API_KEY="${PLEXBEAM_API_KEY:-}"
 SHARED_DIR="${PLEXBEAM_SHARED_SEGMENT_DIR:-}"
 UPDATE_REPO="${PLEXBEAM_UPDATE_REPO:-local}"
+CALLBACK_URL="${PLEXBEAM_CALLBACK_URL:-}"
 
 # --- Validate ----------------------------------------------------------------
 if [[ ! -d "$TRANSCODER_DIR" ]]; then
@@ -105,6 +106,7 @@ sed \
     -e "s|__REMOTE_WORKER_URL__|${WORKER_URL}|g" \
     -e "s|__REMOTE_API_KEY__|${API_KEY}|g" \
     -e "s|__SHARED_SEGMENT_DIR__|${SHARED_DIR}|g" \
+    -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
     "$TEMPLATE" > "$PREBAKED"
 
 chmod +x "$PREBAKED"
@@ -120,6 +122,7 @@ sed \
     -e "s|__REMOTE_WORKER_URL__|${WORKER_URL}|g" \
     -e "s|__REMOTE_API_KEY__|${API_KEY}|g" \
     -e "s|__SHARED_SEGMENT_DIR__|${SHARED_DIR}|g" \
+    -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
     "$TEMPLATE" > "$TRANSCODER_PATH"
 
 chmod 755 "$TRANSCODER_PATH"
@@ -140,6 +143,7 @@ PLEX_VERSION="__PLEX_VERSION__"
 REMOTE_WORKER_URL="__WORKER_URL__"
 REMOTE_API_KEY="__API_KEY__"
 SHARED_SEGMENT_DIR="__SHARED_DIR__"
+CALLBACK_URL="__CALLBACK_URL__"
 METAEOF
 # Fill in actual values (sed is safer than heredoc expansion for paths with spaces)
 sed -i \
@@ -152,6 +156,7 @@ sed -i \
     -e "s|__WORKER_URL__|${WORKER_URL}|" \
     -e "s|__API_KEY__|${API_KEY}|" \
     -e "s|__SHARED_DIR__|${SHARED_DIR}|" \
+    -e "s|__CALLBACK_URL__|${CALLBACK_URL}|" \
     "${LOG_BASE}/.install_meta"
 
 echo "[+] Metadata written to: ${LOG_BASE}/.install_meta"

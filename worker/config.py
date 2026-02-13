@@ -122,6 +122,13 @@ class WorkerSettings(BaseSettings):
         description="Plex server URL for fetching media (e.g., http://192.168.1.100:32400)"
     )
 
+    # Beam mode (remote workers without shared filesystem)
+    beam_max_bitrate: Optional[str] = Field(
+        default=None,
+        description="Max video bitrate for beam mode output (e.g., '4M'). "
+                    "Caps output to fit bandwidth-limited networks like WiFi."
+    )
+
     # Cleanup
     cleanup_temp_after_hours: int = Field(
         default=24,

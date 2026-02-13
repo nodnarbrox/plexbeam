@@ -50,6 +50,10 @@ services:
       - PLEXBEAM_API_KEY=${PLEXBEAM_API_KEY:-}
       - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
       - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
+      - PLEXBEAM_CALLBACK_URL=${PLEXBEAM_CALLBACK_URL:-}
+      # Beam mode: throttle upload to leave bandwidth for segment downloads.
+      # Set to "1M" for WiFi, "0" for unlimited (wired Ethernet).
+      - PLEXBEAM_UPLOAD_RATE=${PLEXBEAM_UPLOAD_RATE:-0}
     volumes:
       - ${PLEX_CONFIG_PATH:-./config/plex}:/config
       - ${MEDIA_PATH:-/mnt/media}:/media
@@ -75,6 +79,7 @@ services:
       - PLEXBEAM_API_KEY=${PLEXBEAM_API_KEY:-}
       - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
       - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
+      - PLEXBEAM_CALLBACK_URL=${PLEXBEAM_CALLBACK_URL:-}
     volumes:
       - ${JELLYFIN_CONFIG_PATH:-./config/jellyfin}:/config
       - ${MEDIA_PATH:-/mnt/media}:/media
