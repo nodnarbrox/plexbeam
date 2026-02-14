@@ -29,6 +29,7 @@ REMOTE_WORKER_URL=""
 REMOTE_API_KEY=""
 SHARED_SEGMENT_DIR=""
 CALLBACK_URL=""
+WORKER_POOL=""
 SERVER_TYPE=""  # auto-detect if not specified
 
 # Parse args
@@ -58,6 +59,10 @@ while [[ $# -gt 0 ]]; do
             CALLBACK_URL="$2"
             shift 2
             ;;
+        --worker-pool)
+            WORKER_POOL="$2"
+            shift 2
+            ;;
         --repo)
             UPDATE_REPO="$2"
             shift 2
@@ -76,6 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --worker URL       Remote GPU worker URL (e.g., http://192.168.1.100:8765)"
             echo "  --api-key KEY      API key for worker authentication"
             echo "  --shared-dir PATH  Shared directory for segment output (SMB/NFS mount)"
+            echo "  --worker-pool LIST Comma-separated worker URLs (@local tag for disk-access)"
             echo ""
             echo "Update Options:"
             echo "  --repo URL         GitHub repo or local path for auto-updates"
@@ -339,6 +345,7 @@ if [[ "$SERVER_TYPE" == "plex" ]]; then
         -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
         -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
         -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
+        -e "s|__WORKER_POOL__|${WORKER_POOL}|g" \
         "${CARTRIDGE_HOME}/cartridge.sh" > "$TRANSCODER_PATH"
 
     chmod 755 "$TRANSCODER_PATH"
@@ -364,6 +371,7 @@ else
         -e "s|__REMOTE_API_KEY__|${REMOTE_API_KEY}|g" \
         -e "s|__SHARED_SEGMENT_DIR__|${SHARED_SEGMENT_DIR}|g" \
         -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
+        -e "s|__WORKER_POOL__|${WORKER_POOL}|g" \
         "${CARTRIDGE_HOME}/cartridge.sh" > "$SHIM_PATH"
 
     chmod 755 "$SHIM_PATH"
@@ -418,6 +426,7 @@ REMOTE_WORKER_URL=${REMOTE_WORKER_URL}
 REMOTE_API_KEY=${REMOTE_API_KEY}
 SHARED_SEGMENT_DIR=${SHARED_SEGMENT_DIR}
 CALLBACK_URL=${CALLBACK_URL}
+WORKER_POOL=${WORKER_POOL}
 EOF
 
 echo -e "  ${GREEN}✓${RESET} Metadata saved"

@@ -345,6 +345,25 @@ async def health_check():
     )
 
 
+@app.get("/probe")
+async def probe_media(path: str, x_api_key: Optional[str] = Header(None)):
+    """Probe media file for duration. Used by cartridge for multi-GPU splits."""
+    verify_api_key(x_api_key)
+    try:
+        result = await asyncio.create_subprocess_exec(
+            settings.ffprobe_path, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0", path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        duration = float(stdout.decode().strip() or 0)
+        return {"duration": duration, "path": path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Probe failed: {e}")
+
+
 @app.post("/transcode", response_model=TranscodeResponse)
 async def create_transcode_job(
     request: TranscodeRequest,
@@ -983,11 +1002,16 @@ async def beam_stream(job_id: str, request: Request):
     logger.info(f"[{job_id}] Beam stream command: {' '.join(cmd)}")
 
     # Start ffmpeg with stdin pipe
+    # Use output_dir as cwd so DASH segments land in the right directory
+    # (ffmpeg 4.4.x doesn't support absolute paths in -init_seg_name)
+    proc_cwd = str(job._output_dir) if hasattr(job, '_output_dir') and job._output_dir else None
+    logger.info(f"[{job_id}] Beam CWD: {proc_cwd!r}, _output_dir={getattr(job, '_output_dir', 'NOT SET')!r}, last_arg={cmd[-1]!r}")
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        cwd=proc_cwd
     )
 
     # Increase write buffer limits for smoother throughput (2MB high / 512KB low)

@@ -212,7 +212,13 @@ settings = WorkerSettings()
 
 
 def init_directories():
-    """Create necessary directories."""
+    """Create necessary directories.
+
+    Resolves temp_dir/log_dir to absolute paths so that subprocess cwd
+    doesn't cause ffmpeg to write segments to doubly-nested relative paths.
+    """
+    settings.temp_dir = settings.temp_dir.resolve()
+    settings.log_dir = settings.log_dir.resolve()
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     if settings.shared_output_dir:

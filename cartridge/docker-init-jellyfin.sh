@@ -30,6 +30,7 @@ API_KEY="${PLEXBEAM_API_KEY:-}"
 SHARED_DIR="${PLEXBEAM_SHARED_SEGMENT_DIR:-}"
 UPDATE_REPO="${PLEXBEAM_UPDATE_REPO:-local}"
 CALLBACK_URL="${PLEXBEAM_CALLBACK_URL:-}"
+WORKER_POOL="${PLEXBEAM_WORKER_POOL:-}"
 
 # --- Find jellyfin-ffmpeg ----------------------------------------------------
 JELLYFIN_FFMPEG=""
@@ -90,6 +91,7 @@ sed \
     -e "s|__REMOTE_API_KEY__|${API_KEY}|g" \
     -e "s|__SHARED_SEGMENT_DIR__|${SHARED_DIR}|g" \
     -e "s|__CALLBACK_URL__|${CALLBACK_URL}|g" \
+    -e "s|__WORKER_POOL__|${WORKER_POOL}|g" \
     "$TEMPLATE" > "$SHIM_PATH"
 
 chmod 755 "$SHIM_PATH"
@@ -168,6 +170,7 @@ REMOTE_WORKER_URL="__WORKER_URL__"
 REMOTE_API_KEY="__API_KEY__"
 SHARED_SEGMENT_DIR="__SHARED_DIR__"
 CALLBACK_URL="__CALLBACK_URL__"
+WORKER_POOL="__WORKER_POOL__"
 METAEOF
 sed -i \
     -e "s|__DATE__|$(date -Iseconds)|" \
@@ -178,6 +181,7 @@ sed -i \
     -e "s|__API_KEY__|${API_KEY}|" \
     -e "s|__SHARED_DIR__|${SHARED_DIR}|" \
     -e "s|__CALLBACK_URL__|${CALLBACK_URL}|" \
+    -e "s|__WORKER_POOL__|${WORKER_POOL}|" \
     "${LOG_BASE}/.install_meta"
 
 echo "[+] Metadata written to: ${LOG_BASE}/.install_meta"

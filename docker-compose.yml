@@ -51,9 +51,15 @@ services:
       - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
       - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
       - PLEXBEAM_CALLBACK_URL=${PLEXBEAM_CALLBACK_URL:-}
+      # Multi-GPU worker pool (comma-separated, @local tag for disk-access workers)
+      - PLEXBEAM_WORKER_POOL=${PLEXBEAM_WORKER_POOL:-}
       # Beam mode: throttle upload to leave bandwidth for segment downloads.
       # Set to "1M" for WiFi, "0" for unlimited (wired Ethernet).
       - PLEXBEAM_UPLOAD_RATE=${PLEXBEAM_UPLOAD_RATE:-0}
+      # Multi-GPU dispatch strategy: A=chunked, B=weighted-split, C=bittorrent (default)
+      - PLEXBEAM_MULTI_MODE=${PLEXBEAM_MULTI_MODE:-C}
+      # Chunk duration in seconds for modes A and C (default 300s)
+      - PLEXBEAM_CHUNK_DURATION=${PLEXBEAM_CHUNK_DURATION:-300}
     volumes:
       - ${PLEX_CONFIG_PATH:-./config/plex}:/config
       - ${MEDIA_PATH:-/mnt/media}:/media
@@ -80,6 +86,10 @@ services:
       - PLEXBEAM_SHARED_SEGMENT_DIR=${PLEXBEAM_SHARED_SEGMENT_DIR:-}
       - PLEXBEAM_UPDATE_REPO=${PLEXBEAM_UPDATE_REPO:-local}
       - PLEXBEAM_CALLBACK_URL=${PLEXBEAM_CALLBACK_URL:-}
+      - PLEXBEAM_WORKER_POOL=${PLEXBEAM_WORKER_POOL:-}
+      - PLEXBEAM_UPLOAD_RATE=${PLEXBEAM_UPLOAD_RATE:-0}
+      - PLEXBEAM_MULTI_MODE=${PLEXBEAM_MULTI_MODE:-C}
+      - PLEXBEAM_CHUNK_DURATION=${PLEXBEAM_CHUNK_DURATION:-300}
     volumes:
       - ${JELLYFIN_CONFIG_PATH:-./config/jellyfin}:/config
       - ${MEDIA_PATH:-/mnt/media}:/media
