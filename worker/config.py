@@ -65,6 +65,10 @@ class WorkerSettings(BaseSettings):
         default=0,
         description="NVENC GPU index"
     )
+    nvenc_hwdecode: bool = Field(
+        default=False,
+        description="Use NVDEC hardware decode (auto-detected at startup for Turing+ GPUs)"
+    )
 
     # Paths
     temp_dir: Path = Field(

@@ -53,6 +53,8 @@ class TranscodeRequest(BaseModel):
     metadata: dict = Field(default_factory=dict)
     source: str = Field(default="plex", description="Source server type (plex or jellyfin)")
     beam_stream: bool = Field(default=False, description="If true, input will be streamed via /beam/stream endpoint")
+    pull_url: Optional[str] = Field(default=None, description="URL to download input file from (pull mode for cloud workers)")
+    staged_input: Optional[str] = Field(default=None, description="Session ID of a previously staged file (upload once, transcode many)")
 
 
 class TranscodeResponse(BaseModel):
@@ -83,6 +85,7 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     hw_accel: str
+    hw_decode: bool = False
     active_jobs: int
     ffmpeg_available: bool
 
@@ -135,6 +138,10 @@ class JobQueue:
                 logger.info(f"Worker {worker_id} processing job {job.job_id}")
 
                 try:
+                    # Pull mode: download input file before transcoding
+                    if job.pull_url:
+                        await self._download_pull_input(job)
+
                     success = await transcoder.transcode(
                         job,
                         progress_callback=lambda p: self._broadcast_progress(p)
@@ -159,6 +166,30 @@ class JobQueue:
 
             except asyncio.CancelledError:
                 break
+
+    async def _download_pull_input(self, job: TranscodeJob):
+        """Download input file from pull_url to temp_dir/{job_id}/input.
+
+        Used by cloud workers (e.g. SaladCloud) that can't receive large
+        streaming POST uploads through their gateway. Instead, the cartridge
+        writes the remuxed chunk to a file server and the worker pulls it.
+        """
+        input_dir = settings.temp_dir / job.job_id
+        input_dir.mkdir(parents=True, exist_ok=True)
+        input_path = input_dir / "input"
+
+        logger.info(f"[{job.job_id}] Pull mode: downloading from {job.pull_url}")
+        total = 0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=10)) as client:
+            async with client.stream("GET", job.pull_url) as response:
+                response.raise_for_status()
+                import aiofiles
+                async with aiofiles.open(input_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        await f.write(chunk)
+                        total += len(chunk)
+
+        logger.info(f"[{job.job_id}] Pull download complete: {total / (1024*1024):.1f} MB → {input_path}")
 
     async def _orphan_reaper(self):
         """Cancel running jobs that haven't been polled for 90+ seconds.
@@ -290,11 +321,69 @@ job_queue = JobQueue()
 # FastAPI App
 # ============================================================================
 
+async def _probe_nvenc():
+    """Quick NVENC probe — encode 1 black frame.  If the GPU rejects NVENC,
+    switch settings.hw_accel to 'none' so all subsequent transcodes use CPU.
+    Then probe NVDEC to enable full hardware decode+encode pipeline on Turing+ GPUs."""
+    if settings.hw_accel != "nvenc":
+        return
+    ffmpeg = settings.ffmpeg_path
+
+    # --- NVENC encode probe ---
+    cmd = [
+        ffmpeg, "-y", "-f", "lavfi", "-i", "color=black:s=256x256:d=0.04",
+        "-c:v", "h264_nvenc", "-frames:v", "1", "-f", "null", "-"
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            err = stderr.decode()[-300:]
+            logger.warning(f"NVENC probe FAILED (rc={proc.returncode}): {err}")
+            logger.warning("Falling back to CPU encoding (libx264)")
+            settings.hw_accel = "none"
+            return
+        else:
+            logger.info("NVENC probe OK — GPU encoding available")
+    except Exception as e:
+        logger.warning(f"NVENC probe exception: {e} — falling back to CPU")
+        settings.hw_accel = "none"
+        return
+
+    # --- NVDEC hardware decode probe ---
+    # Test full HW pipeline: NVDEC decode → scale_cuda → NVENC encode
+    # This works on Turing+ (RTX 20xx, 30xx, 40xx) but fails on Maxwell (M40)
+    # which can't CUVID-decode HEVC Main 10.
+    hwdec_cmd = [
+        ffmpeg, "-y",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-f", "lavfi", "-i", "color=black:s=1920x1080:d=0.04",
+        "-vf", "hwupload_cuda,scale_cuda=1920:1080:format=nv12",
+        "-c:v", "h264_nvenc", "-frames:v", "1", "-f", "null", "-"
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *hwdec_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            settings.nvenc_hwdecode = True
+            logger.info("NVDEC probe OK — full HW pipeline enabled (NVDEC+scale_cuda+NVENC)")
+        else:
+            err = stderr.decode()[-200:]
+            logger.info(f"NVDEC probe failed (rc={proc.returncode}), using CPU decode + NVENC: {err}")
+    except Exception as e:
+        logger.info(f"NVDEC probe exception: {e}, using CPU decode + NVENC")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     # Startup
     init_directories()
+    await _probe_nvenc()
     await job_queue.start_workers()
     logger.info(f"Plex Remote GPU Worker started on {settings.host}:{settings.port}")
     logger.info(f"Hardware acceleration: {settings.hw_accel}")
@@ -340,6 +429,7 @@ async def health_check():
         status="healthy",
         version="1.0.0",
         hw_accel=settings.hw_accel,
+        hw_decode=settings.nvenc_hwdecode,
         active_jobs=len(job_queue.active_jobs),
         ffmpeg_available=ffmpeg_ok
     )
@@ -447,8 +537,27 @@ async def create_transcode_job(
         segment_duration=output_spec.get("segment_duration", 4),
         raw_args=args.get("raw_args", []),
         source=source,
-        callback_url=request.callback_url
+        callback_url=request.callback_url,
+        pull_url=request.pull_url
     )
+
+    # Staged input: symlink pre-uploaded file into job directory so the
+    # existing beam-upload code path picks it up (checks for temp_dir/{job_id}/input).
+    if request.staged_input:
+        staged_file = settings.temp_dir / "staged" / request.staged_input / "input"
+        if not staged_file.exists():
+            raise HTTPException(status_code=404,
+                                detail=f"Staged file not found: {request.staged_input}")
+        job_dir = settings.temp_dir / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        link_path = job_dir / "input"
+        if not link_path.exists():
+            try:
+                link_path.symlink_to(staged_file)
+            except OSError:
+                # Fallback: hard link if symlinks not supported
+                os.link(str(staged_file), str(link_path))
+        logger.info(f"[{job.job_id}] Using staged input from {request.staged_input}")
 
     # Submit to queue (unless beam_stream — the /beam/stream endpoint will run it)
     if request.beam_stream:
@@ -989,9 +1098,13 @@ async def get_segment(job_id: str, filename: str):
 async def beam_stream(job_id: str, request: Request):
     """Stream input directly into ffmpeg stdin for real-time transcoding.
 
-    The cartridge POSTs the input file body while ffmpeg processes it
-    concurrently.  Transcoding starts as soon as the first bytes arrive —
-    no waiting for the full upload.
+    Pipes the request body into ffmpeg as it arrives, then returns 200
+    immediately after the upload finishes.  FFmpeg continues transcoding
+    in the background — the cartridge polls /status/{job_id} for progress.
+
+    This design is compatible with cloud gateways (e.g. SaladCloud) that
+    have a short server_response_timeout: the response is sent within
+    milliseconds of the upload completing, well within any timeout.
     """
     job = job_queue.get_job(job_id)
     if not job:
@@ -1068,28 +1181,79 @@ async def beam_stream(job_id: str, request: Request):
         job_queue.active_jobs.discard(job_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Wait for progress reader to finish (reads stdout until EOF)
-    await progress_task
+    logger.info(f"[{job_id}] Beam upload done: {total / (1024*1024):.1f} MB piped, ffmpeg continues in background")
 
-    # Read stderr and wait for process exit
-    stderr_data = b""
-    if process.stderr:
-        stderr_data = await process.stderr.read()
-    await process.wait()
+    # Background task: wait for ffmpeg to finish and update job status
+    async def _wait_for_completion():
+        try:
+            await progress_task
+            stderr_data = b""
+            if process.stderr:
+                stderr_data = await process.stderr.read()
+            await process.wait()
 
-    job.completed_at = datetime.now()
-    job_queue.active_jobs.discard(job_id)
+            job.completed_at = datetime.now()
+            job_queue.active_jobs.discard(job_id)
 
-    if process.returncode == 0:
-        job.progress.status = "completed"
-        job.progress.progress = 100.0
-        logger.info(f"[{job_id}] Beam stream completed: {total / (1024*1024):.1f} MB streamed")
-    else:
-        job.progress.status = "failed"
-        job.progress.error = stderr_data.decode()[-500:]
-        logger.error(f"[{job_id}] Beam stream failed: {job.progress.error}")
+            if process.returncode == 0:
+                job.progress.status = "completed"
+                job.progress.progress = 100.0
+                logger.info(f"[{job_id}] Beam stream completed: {total / (1024*1024):.1f} MB streamed")
+            else:
+                job.progress.status = "failed"
+                job.progress.error = stderr_data.decode()[-500:]
+                logger.error(f"[{job_id}] Beam stream failed: {job.progress.error}")
+        except Exception as e:
+            logger.error(f"[{job_id}] Beam completion error: {e}")
+            job.progress.status = "failed"
+            job.progress.error = str(e)
+            job_queue.active_jobs.discard(job_id)
 
-    return {"status": job.progress.status, "bytes_streamed": total}
+    asyncio.create_task(_wait_for_completion())
+
+    # Return immediately — ffmpeg keeps running, cartridge polls /status
+    return {"status": "streaming", "bytes_received": total}
+
+
+@app.put("/beam/stage/{session_id}")
+async def beam_stage(session_id: str, request: Request):
+    """Upload input file once for multiple parallel jobs (staged upload).
+
+    Upload a file to a shared staging area. Then submit multiple transcode
+    jobs with staged_input=session_id — each job symlinks to this file and
+    reads locally at full disk speed. Much faster than beam-streaming the
+    same file N times through the network.
+    """
+    import aiofiles
+
+    # Sanitize
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+
+    stage_dir = settings.temp_dir / "staged" / session_id
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    input_path = stage_dir / "input"
+
+    total_bytes = 0
+    async with aiofiles.open(input_path, "wb") as f:
+        async for chunk in request.stream():
+            await f.write(chunk)
+            total_bytes += len(chunk)
+
+    logger.info(f"[stage/{session_id}] Staged upload complete: {total_bytes / (1024*1024):.1f} MB")
+    return {"status": "staged", "session_id": session_id, "size": total_bytes}
+
+
+@app.delete("/beam/stage/{session_id}")
+async def beam_unstage(session_id: str):
+    """Delete a staged file when all jobs are done."""
+    if "/" in session_id or "\\" in session_id or ".." in session_id:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+    stage_dir = settings.temp_dir / "staged" / session_id
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        logger.info(f"[stage/{session_id}] Staged file deleted")
+    return {"status": "deleted", "session_id": session_id}
 
 
 @app.put("/beam/upload/{job_id}")

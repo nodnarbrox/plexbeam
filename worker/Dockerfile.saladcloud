@@ -1,0 +1,59 @@
+# PlexBeam GPU Worker - SaladCloud NVIDIA variant
+# IPv6 binding required for SaladCloud's networking layer
+#
+# Build:  docker build -f Dockerfile.saladcloud -t nodnarb/plexbeam-worker:saladcloud .
+# Push:   docker push nodnarb/plexbeam-worker:saladcloud
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+LABEL maintainer="PlexBeam"
+LABEL description="PlexBeam GPU Worker for SaladCloud (NVIDIA NVENC, IPv6)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.12 and FFmpeg with NVENC support
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3-pip \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.12 the default python
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Copy worker source
+COPY config.py worker.py transcoder.py ./
+
+# Copy entrypoint
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Create runtime directories
+RUN mkdir -p /app/transcode_temp /app/logs
+
+# SaladCloud requires IPv6 binding (::) — traffic routed via IPv6 gateway
+ENV PLEX_WORKER_HW_ACCEL=nvenc \
+    PLEX_WORKER_FFMPEG_PATH=ffmpeg \
+    PLEX_WORKER_FFPROBE_PATH=ffprobe \
+    PLEX_WORKER_HOST=:: \
+    PLEX_WORKER_PORT=8765 \
+    PLEX_WORKER_TEMP_DIR=/app/transcode_temp \
+    PLEX_WORKER_LOG_DIR=/app/logs \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://[::1]:8765/health || exit 1
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

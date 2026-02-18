@@ -59,6 +59,7 @@ class TranscodeJob:
     raw_args: list[str] = field(default_factory=list)
     source: str = "plex"  # "plex" or "jellyfin"
     callback_url: Optional[str] = None  # URL to reach media server from worker (beam mode)
+    pull_url: Optional[str] = None      # URL to download input file from (pull mode for cloud workers)
     split_info: Optional[dict] = None   # Multi-GPU split info (worker_index, total_workers, ss, t)
 
     # Runtime state
@@ -200,7 +201,7 @@ class FFmpegTranscoder:
             if settings.qsv_device:
                 cmd.extend(["-qsv_device", settings.qsv_device])
             cmd.extend(["-hwaccel_output_format", "qsv"])
-        elif hw_accel == "nvenc":
+        elif hw_accel == "nvenc" and settings.nvenc_hwdecode:
             cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
         elif hw_accel == "vaapi":
             device = settings.qsv_device or "/dev/dri/renderD128"
@@ -349,7 +350,7 @@ class FFmpegTranscoder:
 
         return encoders.get(hw_accel, encoders["none"])
 
-    def _extract_plex_info(self, raw_args: list[str]) -> dict:
+    def _extract_plex_info(self, raw_args: list[str], video_codec: str = "") -> dict:
         """Extract essential info from Plex's raw ffmpeg args.
 
         Instead of trying to fix Plex's complex command (VAAPI chains, tonemap,
@@ -372,11 +373,14 @@ class FFmpegTranscoder:
         }
 
         # Detect audio-only (EAE) vs video transcode.
-        # -vn = explicit no video.  -eae_prefix:N = Plex Enhanced Audio Engine (audio-only).
-        # Everything else has video — Plex sends h264_vaapi, libx264, etc. for transcodes.
+        # -vn = explicit no video.
+        # -eae_prefix:N = Plex Enhanced Audio Engine — used for audio decoding (e.g. TrueHD).
+        # EAE can appear in BOTH audio-only jobs AND full video+audio transcodes.
+        # Only treat as audio-only if EAE is present AND no real video encoder is requested.
         has_vn = '-vn' in raw_args
         has_eae = any(arg.startswith('-eae_prefix') for arg in raw_args)
-        info['has_video'] = not has_vn and not has_eae
+        has_video_encoder = video_codec and video_codec not in ('', 'copy')
+        info['has_video'] = not has_vn and (not has_eae or has_video_encoder)
 
         # First pass: find audio filter output label
         audio_output_label = None
@@ -487,7 +491,7 @@ class FFmpegTranscoder:
 
         return info
 
-    def _build_plex_command(self, job_id: str, raw_args: list[str], hw_accel: str, hw_encoder: str, callback_url: str = None, beam_stream: bool = False) -> list[str]:
+    def _build_plex_command(self, job_id: str, raw_args: list[str], hw_accel: str, hw_encoder: str, callback_url: str = None, beam_stream: bool = False, video_codec: str = "") -> list[str]:
         """Build clean ffmpeg args from Plex raw args.
 
         Instead of surgically fixing Plex's complex command (VAAPI tonemap chains,
@@ -498,7 +502,7 @@ class FFmpegTranscoder:
         Audio pipeline preserves Plex's aresample filter with ochl→ocl fix.
         Everything else (Plex-specific options, VAAPI chains, tonemap) is ignored.
         """
-        info = self._extract_plex_info(raw_args)
+        info = self._extract_plex_info(raw_args, video_codec=video_codec)
         path_mappings = settings.get_path_mappings()
 
         logger.info(f"[{job_id}] BUILD PLEX CMD: has_video={info['has_video']}, "
@@ -524,7 +528,11 @@ class FFmpegTranscoder:
             elif hw_accel == "vaapi":
                 device = settings.qsv_device or "/dev/dri/renderD128"
                 parts.extend(["-hwaccel", "vaapi", "-vaapi_device", device])
-            # nvenc: no hwaccel — CPU decode + hwupload_cuda in -vf
+            elif hw_accel == "nvenc" and settings.nvenc_hwdecode:
+                # Full HW pipeline: NVDEC decode → scale_cuda → NVENC encode
+                # (Turing+ GPUs: RTX 20xx, 30xx, 40xx with HEVC Main 10 NVDEC)
+                parts.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+            # nvenc without hwdecode: CPU decode + hwupload_cuda in -vf
             # (M40/GM200 can't CUVID-decode HEVC Main 10)
 
         # === SEEK (before -i for files, after for pipes) ===
@@ -564,7 +572,12 @@ class FFmpegTranscoder:
             parts.extend(["-map", "0:v:0"])
 
             if hw_accel == "nvenc":
-                vf = "scale=1920:-2:flags=fast_bilinear:sws_dither=none,format=nv12,hwupload_cuda"
+                if settings.nvenc_hwdecode:
+                    # Full HW pipeline: frames already on GPU from NVDEC
+                    vf = "scale_cuda=1920:-1:format=nv12"
+                else:
+                    # CPU decode pipeline: scale on CPU then upload to GPU
+                    vf = "scale=1920:-2:flags=fast_bilinear:sws_dither=none,format=nv12,hwupload_cuda"
                 parts.extend(["-vf", vf, "-c:v", "h264_nvenc"])
                 if beam_mode and settings.beam_max_bitrate:
                     parts.extend([
@@ -828,7 +841,7 @@ class FFmpegTranscoder:
                         hwaccel_args.extend(["-qsv_device", settings.qsv_device])
                     hwaccel_args.extend(["-hwaccel_output_format", "qsv",
                                          "-extra_hw_frames", "8"])
-                elif hw_accel == "nvenc":
+                elif hw_accel == "nvenc" and settings.nvenc_hwdecode:
                     hwaccel_args = ["-hwaccel", "cuda",
                                     "-hwaccel_output_format", "cuda"]
                 elif hw_accel == "vaapi":
@@ -863,7 +876,7 @@ class FFmpegTranscoder:
             hw_encoder = settings.get_video_encoder()
 
             if job.source == "plex":
-                filtered_args = self._build_plex_command(job.job_id, job.raw_args, hw_accel, hw_encoder, callback_url=job.callback_url)
+                filtered_args = self._build_plex_command(job.job_id, job.raw_args, hw_accel, hw_encoder, callback_url=job.callback_url, video_codec=job.video_codec)
             else:
                 filtered_args = self._filter_standard_args(job.raw_args, job_id=job.job_id, callback_url=job.callback_url)
 
@@ -932,8 +945,54 @@ class FFmpegTranscoder:
                 logger.info(f"[{job.job_id}] Transcode completed successfully")
                 return True
             else:
+                stderr_text = stderr.decode()[-1000:]
+                # Auto-fallback: if NVENC/CUDA fails, retry with CPU encoding
+                nvenc_errors = ["OpenEncodeSessionEx failed", "unsupported device",
+                                "Cannot load libnvidia-encode", "nvenc", "NVENC"]
+                if use_raw and settings.hw_accel != "none" and any(e in stderr_text for e in nvenc_errors):
+                    logger.warning(f"[{job.job_id}] HW encoder failed, retrying with CPU (libx264): {stderr_text[:200]}")
+                    # Rebuild command with CPU encoding
+                    cpu_cmd = [self.ffmpeg_path, "-y", "-nostdin", "-threads", "0", "-thread_type", "frame",
+                               "-progress", "pipe:1", "-stats_period", "0.5", "-loglevel", "error"]
+                    if job.source == "plex":
+                        cpu_args = self._build_plex_command(job.job_id, job.raw_args, "none", "libx264",
+                                                            callback_url=job.callback_url, video_codec=job.video_codec)
+                    else:
+                        cpu_args = self._filter_standard_args(job.raw_args, job_id=job.job_id, callback_url=job.callback_url)
+                    if cpu_args:
+                        last_arg = cpu_args[-1]
+                        if last_arg in ("dash", "hls"):
+                            output_dir = Path(settings.temp_dir).resolve() / job.job_id
+                            output_dir.mkdir(parents=True, exist_ok=True)
+                            cpu_args[-1] = str(output_dir / ("output.mpd" if last_arg == "dash" else "output.m3u8"))
+                            job._output_dir = output_dir
+                    cpu_cmd.extend(cpu_args)
+                    logger.info(f"[{job.job_id}] CPU fallback cmd: {' '.join(cpu_cmd)}")
+                    job.progress.status = "running"
+                    job.progress.error = None
+                    job.started_at = datetime.now()
+                    job.completed_at = None
+                    proc_cwd2 = str(getattr(job, '_output_dir', None) or '.') if hasattr(job, '_output_dir') and job._output_dir else None
+                    job.process = await asyncio.create_subprocess_exec(
+                        *cpu_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=proc_cwd2)
+                    async for progress in self._parse_progress(job):
+                        if progress_callback:
+                            progress_callback(progress)
+                    _, stderr2 = await job.process.communicate()
+                    job.completed_at = datetime.now()
+                    if job.process.returncode == 0:
+                        job.progress.status = "completed"
+                        job.progress.progress = 100.0
+                        logger.info(f"[{job.job_id}] CPU fallback transcode completed successfully")
+                        return True
+                    else:
+                        job.progress.status = "failed"
+                        job.progress.error = stderr2.decode()[-500:]
+                        logger.error(f"[{job.job_id}] CPU fallback also failed: {job.progress.error}")
+                        return False
+
                 job.progress.status = "failed"
-                job.progress.error = stderr.decode()[-500:]  # Last 500 chars
+                job.progress.error = stderr_text[-500:]
                 logger.error(f"[{job.job_id}] Transcode failed: {job.progress.error}")
                 return False
 
@@ -1017,7 +1076,8 @@ class FFmpegTranscoder:
         if job.source == "plex":
             filtered = self._build_plex_command(
                 job.job_id, job.raw_args, hw_accel, hw_encoder,
-                callback_url=job.callback_url, beam_stream=True
+                callback_url=job.callback_url, beam_stream=True,
+                video_codec=job.video_codec
             )
         else:
             filtered = self._filter_standard_args(

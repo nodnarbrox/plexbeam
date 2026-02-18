@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+# Save original args before any modification — used by fast-start transcoder
+ORIGINAL_ARGS=("$@")
+
 # --- Configuration (baked in by install.sh) ----------------------------------
 CARTRIDGE_VERSION="3.1.0"
 SERVER_TYPE="__SERVER_TYPE__"
@@ -39,6 +42,12 @@ FALLBACK_TO_LOCAL=true              # If true, use local transcoder on failure
 SHARED_SEGMENT_DIR="__SHARED_SEGMENT_DIR__"  # Where worker writes segments
 CALLBACK_URL="__CALLBACK_URL__"     # URL for worker to reach media server (beam mode manifest callbacks)
 WORKER_POOL="__WORKER_POOL__"      # Comma-separated worker URLs (@local = disk access, no upload)
+
+# Pull mode: cloud workers (HTTPS) download chunks via S3 pre-signed URLs.
+# The S3 pull proxy runs on localhost — cartridge uploads to it, gets back an S3 URL.
+# No AWS creds in the cartridge; they live only in the pull proxy process.
+PULL_PROXY_URL="${PLEXBEAM_PULL_PROXY_URL:-http://127.0.0.1:8780}"  # S3 pull proxy (localhost)
+PULL_DIR="${PLEXBEAM_PULL_DIR:-/tmp/plexbeam-pull}"  # Local staging dir for copy-remux
 
 # Environment overrides (for testing without re-install)
 [[ -n "${PLEXBEAM_WORKER_POOL:-}" ]] && WORKER_POOL="$PLEXBEAM_WORKER_POOL"
@@ -84,6 +93,28 @@ _cleanup_remote() {
     # Single-worker cleanup
     if [[ "$DISPATCHED_TO_REMOTE" == "true" ]] && [[ -n "${REMOTE_WORKER_URL:-}" ]]; then
         curl -sf -X DELETE "${REMOTE_WORKER_URL}/job/${SESSION_ID}" &>/dev/null || true
+    fi
+    # Clean up S3 pull files via proxy
+    if [[ -n "${PULL_PROXY_URL:-}" ]]; then
+        curl -sf -X DELETE "${PULL_PROXY_URL}/upload/${SESSION_ID}.mkv" &>/dev/null || true
+        for jid in "${MULTI_JOB_IDS[@]}"; do
+            curl -sf -X DELETE "${PULL_PROXY_URL}/upload/${jid}.mkv" &>/dev/null || true
+        done
+    fi
+    # Clean up local URL files
+    if [[ -d "${PULL_DIR:-}" ]]; then
+        rm -f "${PULL_DIR}/${SESSION_ID}"*.url 2>/dev/null || true
+        for jid in "${MULTI_JOB_IDS[@]}"; do
+            rm -f "${PULL_DIR}/${jid}".url 2>/dev/null || true
+        done
+    fi
+    # Kill staged upload if still running
+    if [[ -n "${STAGED_UPLOAD_PID:-}" ]]; then
+        kill "$STAGED_UPLOAD_PID" 2>/dev/null || true
+    fi
+    # Clean up staged file on worker
+    if [[ -n "${STAGED_SESSION_ID:-}" ]] && [[ -n "${LIVE_WORKERS[0]:-}" ]]; then
+        curl -sf -X DELETE "${LIVE_WORKERS[0]}/beam/stage/${STAGED_SESSION_ID}" &>/dev/null || true
     fi
 }
 trap _cleanup_remote EXIT
@@ -157,6 +188,7 @@ TONE_MAP=""
 SEEK_POSITION=""
 SESSION_TOKEN=""
 OUTPUT_DIR=""
+SKIP_TO_SEGMENT=0
 
 PREV_ARG=""
 declare -a RAW_ARGS=()
@@ -191,6 +223,9 @@ for arg in "$@"; do
             ;;
         -progressurl)
             PROGRESS_URL="$arg"
+            ;;
+        -skip_to_segment)
+            SKIP_TO_SEGMENT="$arg"
             ;;
     esac
 
@@ -618,9 +653,20 @@ submit_worker_job() {
     local t="${7:-0}"
 
     local use_beam_stream=false
-    if [[ "$worker_tag" == "remote" ]] && [[ -n "$INPUT_FILE" ]]; then
-        # Beam stream if input is a local file OR a Plex HTTP URL (reachable from this container)
-        if [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
+    local use_pull_url=""
+    local use_staged_input=""
+
+    # Staged mode: file already uploaded to worker — no beam/pull needed
+    if [[ -n "${STAGED_SESSION_ID:-}" ]]; then
+        use_staged_input="${STAGED_SESSION_ID}"
+    elif [[ "$worker_tag" == "remote" ]] && [[ -n "$INPUT_FILE" ]]; then
+        # Cloud workers (HTTPS URLs): use S3 pull mode if proxy URL file exists
+        # The URL file is written by copy_remux_and_upload() before this is called
+        if [[ "${worker_url}" =~ ^https:// ]] && [[ -f "${PULL_DIR}/${job_id}.url" ]]; then
+            use_pull_url=$(cat "${PULL_DIR}/${job_id}.url" 2>/dev/null)
+            log_event "MULTI-GPU" "Worker ${worker_idx}: using S3 pull mode"
+        # LAN remote workers: beam stream (POST input to worker)
+        elif [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
             use_beam_stream=true
         fi
     fi
@@ -651,19 +697,26 @@ submit_worker_job() {
         done
     fi
 
+    # Staged or local workers get -ss/-t injected (file-based seeking).
+    # Beam stream workers DON'T (the stream is pre-seeked by copy_remux_pipe).
+    local inject_seek=false
+    if [[ "$worker_tag" == "local" ]] || [[ -n "$use_staged_input" ]]; then
+        inject_seek=true
+    fi
+
     for a in "${RAW_ARGS[@]}"; do
         # Hex stream IDs (#0xNN) and stream index remapping handled by the worker
         if [[ "$found_input" == "false" ]] && [[ "$a" == "-i" ]]; then
-            # Local workers: inject -ss before -i to seek into their portion
-            if [[ "$worker_tag" == "local" ]] && [[ "$ss" -gt 0 ]]; then
+            # Inject -ss before -i for file-based seeking (local + staged)
+            if [[ "$inject_seek" == "true" ]] && [[ "$ss" -gt 0 ]]; then
                 mod_args+=("-ss" "$ss")
             fi
             mod_args+=("$a")
             found_input=true
         elif [[ "$found_input" == "true" ]] && [[ -z "$mod_args_t_added" ]]; then
             mod_args+=("$a")
-            # Local workers: inject -t after input path to limit duration
-            if [[ "$worker_tag" == "local" ]]; then
+            # Inject -t after input path to limit duration (local + staged)
+            if [[ "$inject_seek" == "true" ]]; then
                 mod_args+=("-t" "$t")
             fi
             mod_args_t_added=1
@@ -711,6 +764,8 @@ submit_worker_job() {
     },
     "source": "${SERVER_TYPE}",
     "beam_stream": ${use_beam_stream},
+    "pull_url": $(if [[ -n "$use_pull_url" ]]; then echo "\"${use_pull_url}\""; else echo "null"; fi),
+    "staged_input": $(if [[ -n "$use_staged_input" ]]; then echo "\"${use_staged_input}\""; else echo "null"; fi),
     "callback_url": $(if [[ -n "$CALLBACK_URL" ]] && [[ "$CALLBACK_URL" != "__CALLBACK_URL__" ]]; then echo "\"${CALLBACK_URL}\""; else echo "null"; fi),
     "metadata": {
         "cartridge_version": "${CARTRIDGE_VERSION}",
@@ -776,7 +831,7 @@ copy_remux_pipe() {
     # -c copy = no decode/encode, just repackage (~100x realtime)
     "$remux_bin" -v error -ss "$ss" -i "$INPUT_FILE" -t "$t" \
         -map 0 -c copy -f matroska pipe:1 2>/dev/null | \
-    curl -sfg -X POST \
+    curl -sfg --http1.1 -X POST \
         --connect-timeout "$REMOTE_TIMEOUT" \
         --max-time 7200 \
         --limit-rate "$upload_rate" \
@@ -791,6 +846,50 @@ copy_remux_pipe() {
         log_event "MULTI-GPU" "Worker ${worker_idx}: beam stream failed (rc=${rc})"
     fi
     return $rc
+}
+
+# --- Copy-remux a time range, upload to S3 via pull proxy, store URL ---------
+# Writes the pre-signed S3 URL to /tmp/plexbeam-pull/{job_id}.url
+copy_remux_and_upload() {
+    local job_id="$1"
+    local ss="$2"
+    local t="$3"
+    local worker_idx="$4"
+
+    mkdir -p "$PULL_DIR"
+
+    log_event "MULTI-GPU" "Worker ${worker_idx}: copy-remux ss=${ss} t=${t} → S3 upload"
+
+    local remux_bin="$REAL_TRANSCODER"
+    if [[ -x /usr/bin/ffmpeg ]]; then
+        remux_bin="/usr/bin/ffmpeg"
+    fi
+
+    # Copy-remux and pipe directly to S3 pull proxy (no temp file needed)
+    local response
+    response=$("$remux_bin" -v error -ss "$ss" -i "$INPUT_FILE" -t "$t" \
+        -map 0 -c copy -f matroska pipe:1 2>/dev/null | \
+    curl -sf -X PUT \
+        --connect-timeout 5 \
+        --max-time 600 \
+        -H "Transfer-Encoding: chunked" \
+        -T - \
+        "${PULL_PROXY_URL}/upload/${job_id}.mkv" 2>/dev/null)
+
+    local rc=$?
+    if [[ $rc -eq 0 ]] && [[ -n "$response" ]]; then
+        # Extract URL from JSON response {"url": "https://...", ...}
+        local s3_url
+        s3_url=$(echo "$response" | grep -o '"url":"[^"]*"' | cut -d'"' -f4)
+        if [[ -n "$s3_url" ]]; then
+            echo "$s3_url" > "${PULL_DIR}/${job_id}.url"
+            log_event "MULTI-GPU" "Worker ${worker_idx}: S3 upload done → ${job_id}.mkv"
+            return 0
+        fi
+    fi
+
+    log_event "MULTI-GPU" "Worker ${worker_idx}: S3 upload failed (rc=${rc})"
+    return 1
 }
 
 # --- Download segments from one worker with per-stream offset renaming ------
@@ -905,6 +1004,21 @@ _ws_assign_chunk() {
 
     log_event "MULTI-GPU" "Assign chunk ${c} (ss=${WS_CHUNK_SS[$c]} t=${WS_CHUNK_T[$c]}) → worker ${w} (${wtag})"
 
+    # For cloud workers (HTTPS): upload chunk to S3 first, THEN submit job with the S3 URL.
+    # For LAN workers: submit job first, then stream input in background.
+    if [[ "$wtag" == "remote" ]] && [[ "${wurl}" =~ ^https:// ]] && [[ -n "$PULL_PROXY_URL" ]]; then
+        # S3 pull mode: upload chunk to S3 via local proxy (blocking)
+        copy_remux_and_upload "$jid" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}" "$w"
+        if [[ $? -ne 0 ]]; then
+            log_event "MULTI-GPU" "S3 upload failed for chunk ${c} to worker ${w}"
+            WS_CHUNK_STATE[$c]="pending"
+            WS_CHUNK_WORKER[$c]=-1
+            WS_WORKER_BUSY[$w]=0
+            WS_WORKER_CHUNK[$w]=-1
+            return 1
+        fi
+    fi
+
     if ! submit_worker_job "$wurl" "$wtag" "$jid" "$c" "$n_chunks" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}"; then
         log_event "MULTI-GPU" "Failed to submit chunk ${c} to worker ${w}"
         WS_CHUNK_STATE[$c]="pending"
@@ -914,11 +1028,15 @@ _ws_assign_chunk() {
         return 1
     fi
 
-    # Start beam stream for remote workers
-    if [[ "$wtag" == "remote" ]] && [[ -f "$INPUT_FILE" ]]; then
-        copy_remux_pipe "$wurl" "$jid" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}" "$w" &
-        WS_WORKER_STREAM_PID[$w]=$!
-        MULTI_STREAM_PIDS+=("$!")
+    # Start beam stream for LAN remote workers — SKIP if staged (file already on worker)
+    if [[ -z "${STAGED_SESSION_ID:-}" ]]; then
+        if [[ "$wtag" == "remote" ]] && ! [[ "${wurl}" =~ ^https:// ]]; then
+            if [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
+                copy_remux_pipe "$wurl" "$jid" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}" "$w" &
+                WS_WORKER_STREAM_PID[$w]=$!
+                MULTI_STREAM_PIDS+=("$!")
+            fi
+        fi
     fi
 }
 
@@ -963,7 +1081,8 @@ _ws_download_chunk_bg() {
         batch=0
         while IFS= read -r seg; do
             [[ -z "$seg" ]] && continue
-            curl -sf "${wurl}/beam/segment/${jid}/${seg}" \
+            curl -sf --connect-timeout 5 --max-time 30 \
+                "${wurl}/beam/segment/${jid}/${seg}" \
                 -o "${chunk_staging}/${seg}" 2>/dev/null &
             if [[ "$seg" =~ chunk-stream0- ]]; then
                 vid_count=$((vid_count + 1))
@@ -971,7 +1090,7 @@ _ws_download_chunk_bg() {
                 aud_count=$((aud_count + 1))
             fi
             batch=$((batch + 1))
-            if (( batch >= 50 )); then
+            if (( batch >= 20 )); then
                 wait 2>/dev/null || true
                 batch=0
             fi
@@ -1049,9 +1168,12 @@ _ws_process_ready_chunks() {
                 [[ -f "$init_file" ]] || continue
                 cp "$init_file" "${OUTPUT_DIR}/" 2>/dev/null
             done
-            # Copy manifest from chunk 0 as base
+            # Copy manifest from chunk 0 as base, fix startNumber for skip_to_segment
             if [[ -f "${chunk_staging}/output.mpd" ]]; then
                 cp "${chunk_staging}/output.mpd" "${OUTPUT_DIR}/output.mpd" 2>/dev/null
+                if [[ $skip_base -gt 0 ]]; then
+                    sed -i "s/startNumber=\"1\"/startNumber=\"$((skip_base + 1))\"/" "${OUTPUT_DIR}/output.mpd" 2>/dev/null
+                fi
             fi
         fi
 
@@ -1178,10 +1300,14 @@ _dispatch_chunked_simple() {
     mkdir -p "$staging_dir"
 
     local next_processable=0
-    local cumulative_vid_offset=0
-    local cumulative_aud_offset=0
+    local skip_base=0
+    [[ "$SKIP_TO_SEGMENT" -gt 0 ]] 2>/dev/null && skip_base=$((SKIP_TO_SEGMENT - 1))
+    local cumulative_vid_offset=$skip_base
+    local cumulative_aud_offset=$skip_base
     local chunks_completed=0
     local total_segs_output=0
+
+    log_event "MODE-A" "Segment offset base: ${skip_base} (skip_to_segment=${SKIP_TO_SEGMENT})"
 
     # ===== Main poll loop =====
     local ws_start_epoch
@@ -1224,7 +1350,7 @@ _dispatch_chunked_simple() {
             local wurl="${LIVE_WORKERS[$w]}"
 
             local status_resp
-            status_resp=$(curl -sf --connect-timeout 2 "${wurl}/status/${jid}" 2>/dev/null || echo "")
+            status_resp=$(curl -sf --connect-timeout 2 --max-time 5 "${wurl}/status/${jid}" 2>/dev/null || echo "")
             [[ -z "$status_resp" ]] && continue
 
             local wstatus
@@ -1423,7 +1549,7 @@ _dispatch_weighted_split() {
             continue
         fi
 
-        if [[ "$wtag" == "remote" ]] && [[ -f "$INPUT_FILE" ]]; then
+        if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
             copy_remux_pipe "$wurl" "$cal_jid" 0 "$cal_duration" "$w" &
             CAL_STREAM_PIDS[$w]=$!
         fi
@@ -1449,7 +1575,7 @@ _dispatch_weighted_split() {
             local wurl="${LIVE_WORKERS[$w]}"
             local cal_jid="${CAL_JOB_IDS[$w]}"
             local status_resp
-            status_resp=$(curl -sf --connect-timeout 2 "${wurl}/status/${cal_jid}" 2>/dev/null || echo "")
+            status_resp=$(curl -sf --connect-timeout 2 --max-time 5 "${wurl}/status/${cal_jid}" 2>/dev/null || echo "")
             [[ -z "$status_resp" ]] && continue
 
             local wstatus
@@ -1577,7 +1703,7 @@ _dispatch_weighted_split() {
 
         W_STATUS[$w]="running"
 
-        if [[ "$wtag" == "remote" ]] && [[ -f "$INPUT_FILE" ]]; then
+        if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
             copy_remux_pipe "$wurl" "$jid" "${W_SS[$w]}" "${W_T[$w]}" "$w" &
             W_STREAM_PIDS[$w]=$!
             MULTI_STREAM_PIDS+=("$!")
@@ -1599,8 +1725,11 @@ _dispatch_weighted_split() {
     declare -A W_DOWNLOADED=()
     declare -A W_STREAM_OFFSETS=()
 
-    W_STREAM_OFFSETS["w0_s0"]=0
-    W_STREAM_OFFSETS["w0_s1"]=0
+    local skip_base=0
+    [[ "$SKIP_TO_SEGMENT" -gt 0 ]] 2>/dev/null && skip_base=$((SKIP_TO_SEGMENT - 1))
+    W_STREAM_OFFSETS["w0_s0"]=$skip_base
+    W_STREAM_OFFSETS["w0_s1"]=$skip_base
+    log_event "MODE-B" "Segment offset base: ${skip_base} (skip_to_segment=${SKIP_TO_SEGMENT})"
 
     local wb_start_epoch
     wb_start_epoch=$(date +%s)
@@ -1628,7 +1757,7 @@ _dispatch_weighted_split() {
             local jid="${W_JOB_IDS[$w]}"
 
             local status_resp
-            status_resp=$(curl -sf --connect-timeout 2 "${wurl}/status/${jid}" 2>/dev/null || echo "")
+            status_resp=$(curl -sf --connect-timeout 2 --max-time 5 "${wurl}/status/${jid}" 2>/dev/null || echo "")
             [[ -z "$status_resp" ]] && continue
 
             local wstatus
@@ -1901,7 +2030,7 @@ _bt_prefetch_next() {
     local n_workers=$2
 
     [[ "${LIVE_TAGS[$w]}" != "remote" ]] && return
-    [[ ! -f "$INPUT_FILE" ]] && return
+    { [[ ! -f "$INPUT_FILE" ]] && [[ ! "$INPUT_FILE" =~ ^https?:// ]]; } && return
 
     if [[ -n "${BT_PREFETCH_PID[$w]:-}" ]]; then
         if kill -0 "${BT_PREFETCH_PID[$w]}" 2>/dev/null; then
@@ -2000,7 +2129,7 @@ _bt_endgame_check() {
         return
     fi
 
-    if [[ "$wtag" == "remote" ]] && [[ -f "$INPUT_FILE" ]]; then
+    if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
         copy_remux_pipe "$wurl" "$dup_jid" "$ss" "$t" "$dup_w" &
         WS_WORKER_STREAM_PID[$dup_w]=$!
         MULTI_STREAM_PIDS+=("$!")
@@ -2008,6 +2137,11 @@ _bt_endgame_check() {
 }
 
 _dispatch_bittorrent() {
+    # Ignore SIGPIPE so Plex closing stderr doesn't kill us.
+    # Plex closes the transcoder's pipes after ~150s if no client is
+    # requesting segments, but Mode C needs to continue regardless.
+    trap '' PIPE
+
     local n_workers=${#LIVE_WORKERS[@]}
     local chunk_dur="${PLEXBEAM_CHUNK_DURATION:-300}"
 
@@ -2097,19 +2231,85 @@ _dispatch_bittorrent() {
 
     DISPATCHED_TO_REMOTE=true
 
+    # ===== Phase 0.5: Fast-start — real transcoder for instant playback =====
+    # Start IMMEDIATELY before any uploads. Plex kills the session if no
+    # segments arrive within ~120-180s. The real Plex transcoder (local CPU)
+    # produces segments within seconds. Once GPU workers take over, we kill it.
+    local fast_start_pid=""
+    if [[ -x "$REAL_TRANSCODER" ]]; then
+        "$REAL_TRANSCODER" "${ORIGINAL_ARGS[@]}" 2>>"${SESSION_DIR}/fast_start.log" &
+        fast_start_pid=$!
+        log_event "MODE-C" "Fast-start: real transcoder pid=${fast_start_pid}"
+    fi
+
+    # ===== Staged upload: optional single-worker optimization =====
+    # Upload file ONCE and have all NVENC sessions read from local disk.
+    # Only used when PLEXBEAM_STAGED_UPLOAD=1 because the blocking upload
+    # is slower than parallel beam streams for most bandwidth scenarios.
+    STAGED_SESSION_ID=""
+    STAGED_UPLOAD_PID=""
+    local unique_urls
+    unique_urls=$(printf '%s\n' "${LIVE_WORKERS[@]}" | sort -u | wc -l)
+    if [[ "${PLEXBEAM_STAGED_UPLOAD:-0}" == "1" ]] && [[ "$unique_urls" -eq 1 ]] && [[ "$n_workers" -ge 2 ]] && [[ -f "$INPUT_FILE" ]]; then
+        local stage_url="${LIVE_WORKERS[0]}"
+        STAGED_SESSION_ID="${SESSION_ID}"
+        log_event "MODE-C" "Single-worker pool detected (${n_workers}x ${stage_url}) — staging file in background"
+
+        local upload_rate="${PLEXBEAM_UPLOAD_RATE:-0}"
+        local rate_flag=""
+        [[ "$upload_rate" != "0" ]] && rate_flag="--limit-rate ${upload_rate}"
+
+        # Upload full file to worker in BACKGROUND (fast-start keeps Plex happy meanwhile)
+        (
+            local stage_start=$(date +%s)
+            curl -sfg --http1.1 -X PUT \
+                --connect-timeout "$REMOTE_TIMEOUT" \
+                --max-time 14400 \
+                ${rate_flag} \
+                -T "$INPUT_FILE" \
+                "${stage_url}/beam/stage/${STAGED_SESSION_ID}" \
+                > /dev/null 2>&1
+            local stage_rc=$?
+            local stage_end=$(date +%s)
+            local stage_dur=$((stage_end - stage_start))
+            if [[ $stage_rc -eq 0 ]]; then
+                echo "$(date -Iseconds) | MODE-C | Staged upload complete in ${stage_dur}s" >> "${LOG_BASE}/cartridge_events.log"
+            else
+                echo "$(date -Iseconds) | MODE-C | Staged upload FAILED rc=${stage_rc}" >> "${LOG_BASE}/cartridge_events.log"
+            fi
+        ) &
+        STAGED_UPLOAD_PID=$!
+        log_event "MODE-C" "Staged upload started in background (pid=${STAGED_UPLOAD_PID})"
+    fi
+
     local staging_dir="${OUTPUT_DIR}/staging"
     mkdir -p "$staging_dir"
 
     local next_processable=0
-    local cumulative_vid_offset=0
-    local cumulative_aud_offset=0
+    local skip_base=0
+    [[ "$SKIP_TO_SEGMENT" -gt 0 ]] 2>/dev/null && skip_base=$((SKIP_TO_SEGMENT - 1))
+    local cumulative_vid_offset=$skip_base
+    local cumulative_aud_offset=$skip_base
     local chunks_completed=0
     local total_segs_output=0
+
+    log_event "MODE-C" "Segment offset base: ${skip_base} (skip_to_segment=${SKIP_TO_SEGMENT})"
 
     local calibration_complete=false
     local distribution_done=false
 
-    # ===== Phase 1: Calibration — assign one chunk per worker =====
+    # ===== Phase 1: Wait for staged upload, then assign chunks =====
+    if [[ -n "$STAGED_UPLOAD_PID" ]]; then
+        log_event "MODE-C" "Waiting for staged upload to complete before assigning chunks..."
+        wait "$STAGED_UPLOAD_PID" 2>/dev/null
+        local stage_rc=$?
+        STAGED_UPLOAD_PID=""
+        if [[ $stage_rc -ne 0 ]]; then
+            log_event "MODE-C" "Staged upload process failed — falling back to beam streaming"
+            STAGED_SESSION_ID=""
+        fi
+    fi
+
     local cal_chunks=$n_workers
     if [[ $cal_chunks -gt $n_chunks ]]; then
         cal_chunks=$n_chunks
@@ -2136,6 +2336,8 @@ _dispatch_bittorrent() {
         set +e; set +u; set +o pipefail
         downloaded=""
         manifest_posted=false
+        c0_skip_base=${skip_base}
+        fast_pid=${fast_start_pid:-}
 
         while true; do
             sleep 2
@@ -2149,35 +2351,55 @@ _dispatch_bittorrent() {
             while IFS= read -r seg; do
                 [[ -z "$seg" ]] && continue
                 [[ "$seg" == "output.mpd" ]] && continue
-                echo "$downloaded" | grep -qF "$seg" 2>/dev/null && continue
+                { echo "$downloaded" | grep -qF "$seg" 2>/dev/null; } 2>/dev/null && continue
 
                 # Download to staging
-                curl -sf "${c0_wurl}/beam/segment/${c0_jid}/${seg}" \
+                curl -sf --connect-timeout 5 --max-time 30 \
+                    "${c0_wurl}/beam/segment/${c0_jid}/${seg}" \
                     -o "${c0_staging}/${seg}" 2>/dev/null || continue
                 downloaded="${downloaded}${seg}
 "
 
-                # Copy ALL chunk 0 segments to OUTPUT_DIR so Plex client
-                # has a continuous stream.  Chunk 0 offset is always 0 so
-                # names match final names (no renaming needed).
-                cp "${c0_staging}/${seg}" "${OUTPUT_DIR}/${seg}" 2>/dev/null
+                # Copy chunk 0 segments to OUTPUT_DIR with skip_to_segment offset
+                # so segment numbering matches what Plex expects.
+                if [[ "$seg" =~ ^chunk-stream([0-9]+)-([0-9]+)\.m4s$ ]]; then
+                    local_sid="${BASH_REMATCH[1]}"
+                    local_num=$((10#${BASH_REMATCH[2]} + c0_skip_base))
+                    out_name=$(printf "chunk-stream%s-%05d.m4s" "$local_sid" "$local_num")
+                    cp "${c0_staging}/${seg}" "${OUTPUT_DIR}/${out_name}" 2>/dev/null
+                else
+                    # init segments — copy as-is
+                    cp "${c0_staging}/${seg}" "${OUTPUT_DIR}/${seg}" 2>/dev/null
+                fi
             done <<< "$seg_files"
 
-            # POST manifest as soon as init + first media segments exist
-            if [[ "$manifest_posted" != "true" ]]; then
+            # Re-download and POST manifest every poll cycle so Plex knows
+            # about newly produced segments (SegmentTimeline grows as ffmpeg
+            # encodes more data — Plex needs periodic updates).
+            if [[ -n "${MANIFEST_CALLBACK_URL:-}" ]]; then
+                first_seg=$(printf "chunk-stream0-%05d.m4s" "$((1 + c0_skip_base))")
                 if [[ -f "${OUTPUT_DIR}/init-stream0.m4s" ]] && \
-                   [[ -f "${OUTPUT_DIR}/chunk-stream0-00001.m4s" ]] && \
-                   [[ -n "${MANIFEST_CALLBACK_URL:-}" ]]; then
-                    # Download worker's manifest
+                   [[ -f "${OUTPUT_DIR}/${first_seg}" ]]; then
                     curl -sf "${c0_wurl}/beam/segment/${c0_jid}/output.mpd" \
                         -o "${OUTPUT_DIR}/output.mpd" 2>/dev/null
+                    if [[ -f "${OUTPUT_DIR}/output.mpd" ]] && [[ $c0_skip_base -gt 0 ]]; then
+                        sed -i "s/startNumber=\"1\"/startNumber=\"$((c0_skip_base + 1))\"/" "${OUTPUT_DIR}/output.mpd" 2>/dev/null
+                    fi
                     if [[ -f "${OUTPUT_DIR}/output.mpd" ]]; then
                         curl -sf -X POST \
                             -H "Content-Type: application/dash+xml" \
                             --data-binary @"${OUTPUT_DIR}/output.mpd" \
                             "${MANIFEST_CALLBACK_URL}" 2>/dev/null || true
-                        manifest_posted=true
-                        echo "[PROGRESSIVE] manifest posted" >> "${staging_dir}/.dl_debug.log" 2>/dev/null
+                        if [[ "$manifest_posted" != "true" ]]; then
+                            manifest_posted=true
+                            # NOTE: Do NOT kill fast-start here. The fast-start holds
+                            # Plex's HTTP pipeline connection (-manifest_name with
+                            # X-Plex-Http-Pipeline=infinite). Killing it drops the
+                            # pipeline, and Plex interprets that as a crash, killing
+                            # the entire session. Fast-start is killed at Mode C
+                            # completion instead (line ~2786).
+                            echo "[PROGRESSIVE] initial manifest posted (first_seg=${first_seg}, startNumber=$((c0_skip_base + 1)))" >> "${staging_dir}/.dl_debug.log" 2>/dev/null
+                        fi
                     fi
                 fi
             fi
@@ -2198,6 +2420,10 @@ _dispatch_bittorrent() {
     local bt_start_epoch
     bt_start_epoch=$(date +%s)
     log_event "MODE-C" "Entering BitTorrent poll loop"
+
+    # Disable errexit in poll loop — Plex may close our stderr pipe at any time
+    # (no client connected), and we must continue regardless.
+    set +e
 
     local poll_count=0
     local max_polls=28800
@@ -2226,7 +2452,7 @@ _dispatch_bittorrent() {
             fi
 
             local status_resp
-            status_resp=$(curl -sf --connect-timeout 2 "${wurl}/status/${jid}" 2>/dev/null || echo "")
+            status_resp=$(curl -sf --connect-timeout 2 --max-time 5 "${wurl}/status/${jid}" 2>/dev/null || echo "")
             [[ -z "$status_resp" ]] && continue
 
             local wstatus
@@ -2550,7 +2776,7 @@ _dispatch_bittorrent() {
                 $((out_time_s / 3600)) $(( (out_time_s % 3600) / 60 )) $((out_time_s % 60)))
 
             printf "frame=0 fps=%s q=-1.0 size=N/A time=%s bitrate=N/A speed=%sx    [%d/%d chunks, %d active,%s]\n" \
-                "${total_fps}" "$time_str" "$speed_val" "$chunks_completed" "$n_chunks" "$busy_count" "$q_info" >&2
+                "${total_fps}" "$time_str" "$speed_val" "$chunks_completed" "$n_chunks" "$busy_count" "$q_info" >&2 2>/dev/null || true
 
             if [[ -n "${PROGRESS_URL:-}" ]]; then
                 curl -sf -X POST \
@@ -2567,6 +2793,13 @@ _dispatch_bittorrent() {
             # Kill progressive download for chunk 0
             kill "$progressive_pid" 2>/dev/null || true
             wait "$progressive_pid" 2>/dev/null || true
+
+            # Kill fast-start transcoder if still running
+            if [[ -n "${fast_start_pid:-}" ]] && kill -0 "$fast_start_pid" 2>/dev/null; then
+                kill "$fast_start_pid" 2>/dev/null || true
+                wait "$fast_start_pid" 2>/dev/null || true
+                log_event "MODE-C" "Killed fast-start transcoder (completion)"
+            fi
 
             log_event "MODE-C" "All ${n_chunks} chunks completed! ${total_segs_output} segments output"
 
@@ -2601,6 +2834,11 @@ _dispatch_bittorrent() {
     # Timeout
     kill "$progressive_pid" 2>/dev/null || true
     wait "$progressive_pid" 2>/dev/null || true
+    # Kill fast-start transcoder if still running
+    if [[ -n "${fast_start_pid:-}" ]] && kill -0 "$fast_start_pid" 2>/dev/null; then
+        kill "$fast_start_pid" 2>/dev/null || true
+        wait "$fast_start_pid" 2>/dev/null || true
+    fi
     log_event "MODE-C" "Timed out after ${max_polls} polls"
     for (( w=0; w<n_workers; w++ )); do
         if [[ ${WS_WORKER_BUSY[$w]} -ne 0 ]]; then
@@ -2654,8 +2892,20 @@ dispatch_to_remote_worker() {
 
     # Build job JSON (beam_stream=true: worker won't enqueue, waits for /beam/stream)
     local use_beam_stream=false
+    local use_pull_url=""
     if [[ -n "$INPUT_FILE" ]]; then
-        if [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
+        # Cloud workers (HTTPS URLs): upload to S3 via pull proxy, get pre-signed URL
+        if [[ "${worker_url}" =~ ^https:// ]] && [[ -n "$PULL_PROXY_URL" ]]; then
+            log_event "REMOTE" "Uploading to S3 for cloud worker..."
+            copy_remux_and_upload "$SESSION_ID" "0" "0" "0"
+            if [[ -f "${PULL_DIR}/${SESSION_ID}.url" ]]; then
+                use_pull_url=$(cat "${PULL_DIR}/${SESSION_ID}.url")
+                log_event "REMOTE" "Using S3 pull mode for cloud worker"
+            else
+                log_event "REMOTE" "S3 upload failed, falling back to beam stream"
+                use_beam_stream=true
+            fi
+        elif [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
             use_beam_stream=true
         fi
     fi
@@ -2687,6 +2937,7 @@ dispatch_to_remote_worker() {
     },
     "source": "${SERVER_TYPE}",
     "beam_stream": ${use_beam_stream},
+    "pull_url": $(if [[ -n "$use_pull_url" ]]; then echo "\"${use_pull_url}\""; else echo "null"; fi),
     "callback_url": $(if [[ -n "$CALLBACK_URL" ]] && [[ "$CALLBACK_URL" != "__CALLBACK_URL__" ]]; then echo "\"${CALLBACK_URL}\""; else echo "null"; fi),
     "metadata": {
         "cartridge_version": "${CARTRIDGE_VERSION}",
@@ -2742,7 +2993,7 @@ JOBEOF
                 if [[ -x /usr/bin/ffmpeg ]]; then remux_bin="/usr/bin/ffmpeg"; fi
                 "$remux_bin" -v error -i "$INPUT_FILE" \
                     -map 0 -c copy -f matroska pipe:1 2>/dev/null | \
-                curl -sg -X POST \
+                curl -sg --http1.1 -X POST \
                     --connect-timeout "$REMOTE_TIMEOUT" \
                     --max-time 7200 \
                     --limit-rate "$upload_rate" \
@@ -2750,7 +3001,7 @@ JOBEOF
                     "${worker_url}/beam/stream/${SESSION_ID}" \
                     > "${SESSION_DIR}/01_beam_stream.json" 2>"${SESSION_DIR}/01_beam_stream_err.log" &
             else
-                curl -sg -X POST \
+                curl -sg --http1.1 -X POST \
                     --connect-timeout "$REMOTE_TIMEOUT" \
                     --max-time 7200 \
                     --limit-rate "$upload_rate" \
@@ -2770,7 +3021,7 @@ JOBEOF
             poll_count=$((poll_count + 1))
 
             local status_response
-            status_response=$(curl -sf --connect-timeout 2 "${worker_url}/status/${SESSION_ID}" 2>/dev/null || echo "")
+            status_response=$(curl -sf --connect-timeout 2 --max-time 5 "${worker_url}/status/${SESSION_ID}" 2>/dev/null || echo "")
 
             if [[ -n "$status_response" ]]; then
                 job_status=$(echo "$status_response" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "")
