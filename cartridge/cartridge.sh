@@ -36,6 +36,7 @@ fi
 
 # Remote GPU Worker Settings
 REMOTE_WORKER_URL="__REMOTE_WORKER_URL__"
+PLEXBEAM_BEAM_DIRECT="${PLEXBEAM_BEAM_DIRECT:-false}"  # Set true for single tunnel worker
 REMOTE_API_KEY="__REMOTE_API_KEY__"
 REMOTE_TIMEOUT=5                    # Seconds to wait for worker response
 FALLBACK_TO_LOCAL=true              # If true, use local transcoder on failure
@@ -475,6 +476,9 @@ parse_worker_pool() {
         if [[ "$entry" == *@local ]]; then
             POOL_URLS+=("${entry%@local}")
             POOL_TAGS+=("local")
+        elif [[ "$entry" == *@beam ]]; then
+            POOL_URLS+=("${entry%@beam}")
+            POOL_TAGS+=("beam")
         else
             POOL_URLS+=("$entry")
             POOL_TAGS+=("remote")
@@ -659,10 +663,15 @@ submit_worker_job() {
     # Staged mode: file already uploaded to worker — no beam/pull needed
     if [[ -n "${STAGED_SESSION_ID:-}" ]]; then
         use_staged_input="${STAGED_SESSION_ID}"
-    elif [[ "$worker_tag" == "remote" ]] && [[ -n "$INPUT_FILE" ]]; then
-        # Cloud workers (HTTPS URLs): use S3 pull mode if proxy URL file exists
-        # The URL file is written by copy_remux_and_upload() before this is called
-        if [[ "${worker_url}" =~ ^https:// ]] && [[ -f "${PULL_DIR}/${job_id}.url" ]]; then
+    elif [[ "$worker_tag" == "remote" || "$worker_tag" == "beam" ]] && [[ -n "$INPUT_FILE" ]]; then
+        # @beam workers: always beam stream (even over HTTPS via Cloudflare Tunnel)
+        if [[ "$worker_tag" == "beam" ]]; then
+            if [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
+                use_beam_stream=true
+                log_event "MULTI-GPU" "Worker ${worker_idx}: beam stream via tunnel"
+            fi
+        # Untagged remote cloud workers (HTTPS URLs): use S3 pull mode if proxy URL file exists
+        elif [[ "${worker_url}" =~ ^https:// ]] && [[ -f "${PULL_DIR}/${job_id}.url" ]]; then
             use_pull_url=$(cat "${PULL_DIR}/${job_id}.url" 2>/dev/null)
             log_event "MULTI-GPU" "Worker ${worker_idx}: using S3 pull mode"
         # LAN remote workers: beam stream (POST input to worker)
@@ -1004,8 +1013,8 @@ _ws_assign_chunk() {
 
     log_event "MULTI-GPU" "Assign chunk ${c} (ss=${WS_CHUNK_SS[$c]} t=${WS_CHUNK_T[$c]}) → worker ${w} (${wtag})"
 
-    # For cloud workers (HTTPS): upload chunk to S3 first, THEN submit job with the S3 URL.
-    # For LAN workers: submit job first, then stream input in background.
+    # For cloud workers (HTTPS, non-beam): upload chunk to S3 first, THEN submit job with the S3 URL.
+    # For @beam and LAN workers: submit job first, then stream input in background.
     if [[ "$wtag" == "remote" ]] && [[ "${wurl}" =~ ^https:// ]] && [[ -n "$PULL_PROXY_URL" ]]; then
         # S3 pull mode: upload chunk to S3 via local proxy (blocking)
         copy_remux_and_upload "$jid" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}" "$w"
@@ -1028,9 +1037,9 @@ _ws_assign_chunk() {
         return 1
     fi
 
-    # Start beam stream for LAN remote workers — SKIP if staged (file already on worker)
+    # Start beam stream for remote/beam workers — SKIP if staged (file already on worker)
     if [[ -z "${STAGED_SESSION_ID:-}" ]]; then
-        if [[ "$wtag" == "remote" ]] && ! [[ "${wurl}" =~ ^https:// ]]; then
+        if { [[ "$wtag" == "remote" ]] && ! [[ "${wurl}" =~ ^https:// ]]; } || [[ "$wtag" == "beam" ]]; then
             if [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; then
                 copy_remux_pipe "$wurl" "$jid" "${WS_CHUNK_SS[$c]}" "${WS_CHUNK_T[$c]}" "$w" &
                 WS_WORKER_STREAM_PID[$w]=$!
@@ -1549,7 +1558,7 @@ _dispatch_weighted_split() {
             continue
         fi
 
-        if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
+        if { [[ "$wtag" == "remote" ]] || [[ "$wtag" == "beam" ]]; } && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
             copy_remux_pipe "$wurl" "$cal_jid" 0 "$cal_duration" "$w" &
             CAL_STREAM_PIDS[$w]=$!
         fi
@@ -1703,7 +1712,7 @@ _dispatch_weighted_split() {
 
         W_STATUS[$w]="running"
 
-        if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
+        if { [[ "$wtag" == "remote" ]] || [[ "$wtag" == "beam" ]]; } && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
             copy_remux_pipe "$wurl" "$jid" "${W_SS[$w]}" "${W_T[$w]}" "$w" &
             W_STREAM_PIDS[$w]=$!
             MULTI_STREAM_PIDS+=("$!")
@@ -2029,7 +2038,7 @@ _bt_prefetch_next() {
     local w=$1
     local n_workers=$2
 
-    [[ "${LIVE_TAGS[$w]}" != "remote" ]] && return
+    [[ "${LIVE_TAGS[$w]}" != "remote" ]] && [[ "${LIVE_TAGS[$w]}" != "beam" ]] && return
     { [[ ! -f "$INPUT_FILE" ]] && [[ ! "$INPUT_FILE" =~ ^https?:// ]]; } && return
 
     if [[ -n "${BT_PREFETCH_PID[$w]:-}" ]]; then
@@ -2129,7 +2138,7 @@ _bt_endgame_check() {
         return
     fi
 
-    if [[ "$wtag" == "remote" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
+    if { [[ "$wtag" == "remote" ]] || [[ "$wtag" == "beam" ]]; } && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
         copy_remux_pipe "$wurl" "$dup_jid" "$ss" "$t" "$dup_w" &
         WS_WORKER_STREAM_PID[$dup_w]=$!
         MULTI_STREAM_PIDS+=("$!")
@@ -2262,11 +2271,14 @@ _dispatch_bittorrent() {
         # Upload full file to worker in BACKGROUND (fast-start keeps Plex happy meanwhile)
         (
             local stage_start=$(date +%s)
+            # Pipe through cat to force chunked transfer encoding.
+            # Cloudflare Tunnel returns 413 for large Content-Length uploads.
+            cat "$INPUT_FILE" | \
             curl -sfg --http1.1 -X PUT \
                 --connect-timeout "$REMOTE_TIMEOUT" \
                 --max-time 14400 \
                 ${rate_flag} \
-                -T "$INPUT_FILE" \
+                -T - \
                 "${stage_url}/beam/stage/${STAGED_SESSION_ID}" \
                 > /dev/null 2>&1
             local stage_rc=$?
@@ -2894,8 +2906,12 @@ dispatch_to_remote_worker() {
     local use_beam_stream=false
     local use_pull_url=""
     if [[ -n "$INPUT_FILE" ]]; then
+        # PLEXBEAM_BEAM_DIRECT=true: force beam stream for single HTTPS worker (e.g. Cloudflare Tunnel)
+        if [[ "${PLEXBEAM_BEAM_DIRECT:-}" == "true" ]] && { [[ -f "$INPUT_FILE" ]] || [[ "$INPUT_FILE" =~ ^https?:// ]]; }; then
+            use_beam_stream=true
+            log_event "REMOTE" "Beam direct mode: streaming to tunnel worker"
         # Cloud workers (HTTPS URLs): upload to S3 via pull proxy, get pre-signed URL
-        if [[ "${worker_url}" =~ ^https:// ]] && [[ -n "$PULL_PROXY_URL" ]]; then
+        elif [[ "${worker_url}" =~ ^https:// ]] && [[ -n "$PULL_PROXY_URL" ]]; then
             log_event "REMOTE" "Uploading to S3 for cloud worker..."
             copy_remux_and_upload "$SESSION_ID" "0" "0" "0"
             if [[ -f "${PULL_DIR}/${SESSION_ID}.url" ]]; then
@@ -3001,11 +3017,15 @@ JOBEOF
                     "${worker_url}/beam/stream/${SESSION_ID}" \
                     > "${SESSION_DIR}/01_beam_stream.json" 2>"${SESSION_DIR}/01_beam_stream_err.log" &
             else
+                # Use cat|curl -T - instead of curl -T file to force chunked
+                # transfer encoding. Cloudflare Tunnel returns 413 for large
+                # Content-Length uploads but allows chunked streams.
+                cat "$INPUT_FILE" | \
                 curl -sg --http1.1 -X POST \
                     --connect-timeout "$REMOTE_TIMEOUT" \
                     --max-time 7200 \
                     --limit-rate "$upload_rate" \
-                    -T "$INPUT_FILE" \
+                    -T - \
                     "${worker_url}/beam/stream/${SESSION_ID}" \
                     > "${SESSION_DIR}/01_beam_stream.json" 2>"${SESSION_DIR}/01_beam_stream_err.log" &
             fi
@@ -3272,7 +3292,15 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         #   Adds -init_hw_device qsv=hw + -filter_hw_device hw
         # -------------------------------------------------------------------
 
-        if [[ -e /dev/dri/renderD128 ]]; then
+        # Detect local GPU: NVENC takes priority over QSV/VAAPI
+        GPU_TYPE="none"
+        if [[ -e /dev/nvidia0 ]]; then
+            GPU_TYPE="nvenc"
+        elif [[ -e /dev/dri/renderD128 ]]; then
+            GPU_TYPE="qsv"
+        fi
+
+        if [[ "$GPU_TYPE" != "none" ]]; then
             # Check if libx264 or libx265 is in the args (no Plex Pass HW encoding)
             NEEDS_REWRITE=false
             for arg in "${LOCAL_ARGS[@]}"; do
@@ -3289,6 +3317,15 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                 CRF_VALUE=""
                 CODEC_REWRITES=""
 
+                # GPU-specific encoder names
+                if [[ "$GPU_TYPE" == "nvenc" ]]; then
+                    ENC_H264="h264_nvenc"
+                    ENC_H265="hevc_nvenc"
+                else
+                    ENC_H264="h264_qsv"
+                    ENC_H265="hevc_qsv"
+                fi
+
                 for i in "${!LOCAL_ARGS[@]}"; do
                     if [[ "$SKIP_NEXT" == "true" ]]; then
                         SKIP_NEXT=false
@@ -3298,17 +3335,17 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                     cur_arg="${LOCAL_ARGS[$i]}"
                     nxt_arg="${LOCAL_ARGS[$((i+1))]:-}"
 
-                    # Replace libx264 → h264_qsv
+                    # Replace libx264 → GPU encoder
                     if [[ "$cur_arg" == "libx264" ]]; then
-                        REWRITTEN_ARGS+=("h264_qsv")
-                        CODEC_REWRITES="${CODEC_REWRITES} libx264→h264_qsv"
+                        REWRITTEN_ARGS+=("$ENC_H264")
+                        CODEC_REWRITES="${CODEC_REWRITES} libx264→${ENC_H264}"
                         continue
                     fi
 
-                    # Replace libx265 → hevc_qsv
+                    # Replace libx265 → GPU encoder
                     if [[ "$cur_arg" == "libx265" ]]; then
-                        REWRITTEN_ARGS+=("hevc_qsv")
-                        CODEC_REWRITES="${CODEC_REWRITES} libx265→hevc_qsv"
+                        REWRITTEN_ARGS+=("$ENC_H265")
+                        CODEC_REWRITES="${CODEC_REWRITES} libx265→${ENC_H265}"
                         continue
                     fi
 
@@ -3332,40 +3369,54 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                         continue
                     fi
 
-                    # Extract CRF value then replace with global_quality (crf + 2)
+                    # CRF → GPU quality mapping
                     if [[ "$cur_arg" == -crf* ]]; then
                         CRF_VALUE="$nxt_arg"
-                        if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then
-                            GQ=$((CRF_VALUE + 2))
-                            (( GQ < 1 )) && GQ=1
-                            (( GQ > 51 )) && GQ=51
+                        if [[ "$GPU_TYPE" == "nvenc" ]]; then
+                            # NVENC: -crf N → -qp N (constqp mode; direct mapping)
+                            QP="${CRF_VALUE:-21}"
+                            (( QP < 1 )) && QP=1
+                            (( QP > 51 )) && QP=51
+                            REWRITTEN_ARGS+=("-qp")
+                            REWRITTEN_ARGS+=("$QP")
+                            CODEC_REWRITES="${CODEC_REWRITES} crf:${CRF_VALUE}→qp:${QP}"
                         else
-                            GQ=21  # fallback: CRF 19 default → 21
+                            # QSV: -crf N → -global_quality N+2
+                            if [[ "$CRF_VALUE" =~ ^[0-9]+$ ]]; then
+                                GQ=$((CRF_VALUE + 2))
+                                (( GQ < 1 )) && GQ=1
+                                (( GQ > 51 )) && GQ=51
+                            else
+                                GQ=21  # fallback: CRF 19 default → 21
+                            fi
+                            REWRITTEN_ARGS+=("-global_quality:0")
+                            REWRITTEN_ARGS+=("$GQ")
+                            CODEC_REWRITES="${CODEC_REWRITES} crf:${CRF_VALUE}→gq:${GQ}"
                         fi
-                        REWRITTEN_ARGS+=("-global_quality:0")
-                        REWRITTEN_ARGS+=("$GQ")
                         SKIP_NEXT=true
-                        CODEC_REWRITES="${CODEC_REWRITES} crf:${CRF_VALUE}→gq:${GQ}"
                         continue
                     fi
 
-                    # Replace any existing -init_hw_device with QSV
+                    # QSV-only: replace -init_hw_device / -filter_hw_device
+                    # NVENC: strip these (not needed for NVENC with CPU decode)
                     if [[ "$cur_arg" == "-init_hw_device" ]]; then
-                        REWRITTEN_ARGS+=("-init_hw_device")
-                        REWRITTEN_ARGS+=("qsv=hw")
+                        if [[ "$GPU_TYPE" == "qsv" ]]; then
+                            REWRITTEN_ARGS+=("-init_hw_device")
+                            REWRITTEN_ARGS+=("qsv=hw")
+                        fi
                         SKIP_NEXT=true
                         continue
                     fi
-
-                    # Replace -filter_hw_device value with QSV device name
                     if [[ "$cur_arg" == "-filter_hw_device" ]]; then
-                        REWRITTEN_ARGS+=("-filter_hw_device")
-                        REWRITTEN_ARGS+=("hw")
+                        if [[ "$GPU_TYPE" == "qsv" ]]; then
+                            REWRITTEN_ARGS+=("-filter_hw_device")
+                            REWRITTEN_ARGS+=("hw")
+                        fi
                         SKIP_NEXT=true
                         continue
                     fi
 
-                    # Rewrite video filter_complex: hwupload + scale_qsv pipeline
+                    # Rewrite video filter_complex scale pipeline
                     if [[ "$cur_arg" == "-filter_complex" ]] && [[ "$nxt_arg" == *"scale=w="* ]] && [[ "$nxt_arg" == "[0:0]"* ]]; then
                         SCALE_W=$(echo "$nxt_arg" | grep -oP 'scale=w=\K\d+')
                         SCALE_H=$(echo "$nxt_arg" | grep -oP ':h=\K\d+')
@@ -3375,9 +3426,16 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
 
                         if [[ -n "$SCALE_W" ]] && [[ -n "$SCALE_H" ]]; then
                             REWRITTEN_ARGS+=("-filter_complex")
-                            REWRITTEN_ARGS+=("[0:0]format=nv12,hwupload=extra_hw_frames=64,scale_qsv=w=${SCALE_W}:h=${SCALE_H}${FILTER_LABEL}")
+                            if [[ "$GPU_TYPE" == "nvenc" ]]; then
+                                # NVENC: CPU scale then hwupload; NVENC accepts nv12 directly
+                                REWRITTEN_ARGS+=("[0:0]scale=w=${SCALE_W}:h=${SCALE_H},format=nv12,hwupload_cuda${FILTER_LABEL}")
+                                CODEC_REWRITES="${CODEC_REWRITES} scale→hwupload_cuda:${SCALE_W}x${SCALE_H}"
+                            else
+                                # QSV: hwupload + scale_qsv
+                                REWRITTEN_ARGS+=("[0:0]format=nv12,hwupload=extra_hw_frames=64,scale_qsv=w=${SCALE_W}:h=${SCALE_H}${FILTER_LABEL}")
+                                CODEC_REWRITES="${CODEC_REWRITES} scale→scale_qsv:${SCALE_W}x${SCALE_H}"
+                            fi
                             SKIP_NEXT=true
-                            CODEC_REWRITES="${CODEC_REWRITES} scale→scale_qsv:${SCALE_W}x${SCALE_H}"
                             continue
                         fi
                     fi
@@ -3385,19 +3443,29 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                     REWRITTEN_ARGS+=("$cur_arg")
                 done
 
-                # Inject -init_hw_device qsv=hw if not already present
-                HAS_HW_INIT=false
-                for arg in "${REWRITTEN_ARGS[@]}"; do
-                    if [[ "$arg" == "-init_hw_device" ]]; then
-                        HAS_HW_INIT=true
-                        break
-                    fi
-                done
+                if [[ "$GPU_TYPE" == "qsv" ]]; then
+                    # Inject -init_hw_device qsv=hw if not already present
+                    HAS_HW_INIT=false
+                    for arg in "${REWRITTEN_ARGS[@]}"; do
+                        if [[ "$arg" == "-init_hw_device" ]]; then
+                            HAS_HW_INIT=true
+                            break
+                        fi
+                    done
 
-                if [[ "$HAS_HW_INIT" == "false" ]]; then
+                    if [[ "$HAS_HW_INIT" == "false" ]]; then
+                        declare -a FINAL_ARGS=()
+                        FINAL_ARGS+=("-init_hw_device" "qsv=hw")
+                        FINAL_ARGS+=("-filter_hw_device" "hw")
+                        FINAL_ARGS+=("${REWRITTEN_ARGS[@]}")
+                        REWRITTEN_ARGS=("${FINAL_ARGS[@]}")
+                    fi
+                elif [[ "$GPU_TYPE" == "nvenc" ]]; then
+                    # NVENC: inject -hwaccel cuda before -i for hw decode path
+                    # (uses CPU decode by default; hwaccel only helps if NVDEC available)
+                    # Also add -delay 0 -bf 0 for low-latency streaming
                     declare -a FINAL_ARGS=()
-                    FINAL_ARGS+=("-init_hw_device" "qsv=hw")
-                    FINAL_ARGS+=("-filter_hw_device" "hw")
+                    FINAL_ARGS+=("-hwaccel" "cuda" "-hwaccel_output_format" "cuda")
                     FINAL_ARGS+=("${REWRITTEN_ARGS[@]}")
                     REWRITTEN_ARGS=("${FINAL_ARGS[@]}")
                 fi
@@ -3432,15 +3500,16 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
                 FINAL_CLEAN+=("${CLEAN_ARGS[@]}")
 
                 LOCAL_ARGS=("${FINAL_CLEAN[@]}")
-                log_event "LOCAL" "QSV rewrite:${CODEC_REWRITES} | stripped:${STRIPPED_FLAGS} (system ffmpeg)"
+                log_event "LOCAL" "${GPU_TYPE^^} rewrite:${CODEC_REWRITES} | stripped:${STRIPPED_FLAGS} (system ffmpeg)"
             fi
         fi
     fi
     # Jellyfin: no arg rewriting needed — standard ffmpeg args pass through clean
 
     # Choose local binary
+    # Plex's bundled transcoder uses musl libc and cannot load glibc GPU drivers.
+    # Use system ffmpeg for any HW rewrite (QSV or NVENC).
     if [[ "$SERVER_TYPE" == "plex" ]] && [[ "$QSV_REWRITE" == "true" ]] && [[ -x /usr/bin/ffmpeg ]]; then
-        # Use system ffmpeg for QSV (Plex's musl libc can't load glibc VA drivers)
         LOCAL_BINARY="/usr/bin/ffmpeg"
     else
         LOCAL_BINARY="$REAL_TRANSCODER"
@@ -3455,7 +3524,8 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         echo "Started:  $(date -Iseconds)"
         echo "Binary:   ${LOCAL_BINARY}"
         echo "Server:   ${SERVER_TYPE}"
-        echo "QSV:      ${QSV_REWRITE}"
+        echo "GPU:      ${GPU_TYPE:-none}"
+        echo "HW:       ${QSV_REWRITE}"
     } >> "${SESSION_DIR}/00_session.log"
 
     if [[ "$QSV_REWRITE" == "true" ]]; then
@@ -3469,10 +3539,11 @@ if [[ "$USE_REMOTE" == "false" ]] || [[ "$REMOTE_SUCCESS" == "false" ]]; then
         } >> "${SESSION_DIR}/00_session.log"
     fi
 
-    if [[ "$QSV_REWRITE" == "true" ]]; then
-        # System ffmpeg needs LIBVA_DRIVER_NAME to find the correct VA driver
+    if [[ "$QSV_REWRITE" == "true" ]] && [[ "${GPU_TYPE:-}" == "qsv" ]]; then
+        # QSV/VAAPI: system ffmpeg needs LIBVA env vars to find the iHD driver
         LIBVA_DRIVER_NAME=iHD LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
     else
+        # NVENC or Plex transcoder: no special env needed
         "$LOCAL_BINARY" "${LOCAL_ARGS[@]}" 2> >(tee "${SESSION_DIR}/stderr.log" >&2)
     fi
     EXIT_CODE=$?

@@ -88,6 +88,7 @@ class HealthResponse(BaseModel):
     hw_decode: bool = False
     active_jobs: int
     ffmpeg_available: bool
+    tunnel_url: Optional[str] = None
 
 
 # ============================================================================
@@ -425,13 +426,24 @@ async def health_check():
         os.popen(f"which {settings.ffmpeg_path} 2>/dev/null || where {settings.ffmpeg_path} 2>nul").read()
     )
 
+    # Read tunnel URL if available (written by tunnel-entrypoint.sh)
+    tunnel_url = None
+    tunnel_url_file = os.path.join(settings.log_dir, "tunnel_url.txt")
+    if os.path.exists(tunnel_url_file):
+        try:
+            with open(tunnel_url_file) as f:
+                tunnel_url = f.read().strip() or None
+        except OSError:
+            pass
+
     return HealthResponse(
         status="healthy",
         version="1.0.0",
         hw_accel=settings.hw_accel,
         hw_decode=settings.nvenc_hwdecode,
         active_jobs=len(job_queue.active_jobs),
-        ffmpeg_available=ffmpeg_ok
+        ffmpeg_available=ffmpeg_ok,
+        tunnel_url=tunnel_url
     )
 
 
