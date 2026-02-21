@@ -181,6 +181,7 @@ reinstall_cartridge() {
     # Bake in the paths
     sed \
         -e "s|__REAL_TRANSCODER_PATH__|${BACKUP_PATH}|g" \
+        -e "s|__SERVER_TYPE__|${SERVER_TYPE:-plex}|g" \
         -e "s|__CARTRIDGE_HOME__|${CARTRIDGE_HOME}|g" \
         -e "s|__UPDATE_REPO__|${UPDATE_REPO:-local}|g" \
         "$CARTRIDGE_SRC" > "$TRANSCODER_PATH"
@@ -188,7 +189,12 @@ reinstall_cartridge() {
     chmod 755 "$TRANSCODER_PATH"
     chown "${PLEX_USER:-plex}:${PLEX_USER:-plex}" "$TRANSCODER_PATH" 2>/dev/null || true
     
-    # Verify
+    # Verify — check no unfilled template placeholders remain
+    if grep -q "__[A-Z_]*__" "$TRANSCODER_PATH" 2>/dev/null; then
+        log "ERROR" "Cartridge has unfilled template placeholders: $(grep -o '__[A-Z_]*__' "$TRANSCODER_PATH" | sort -u | tr '\n' ' ')"
+        return 1
+    fi
+
     if grep -q "PLEXBEAM CARTRIDGE" "$TRANSCODER_PATH" 2>/dev/null; then
         log "INFO" "Cartridge re-installed successfully"
         echo "$(date -Iseconds) | REINSTALL | success | Plex binary backed up and cartridge restored" >> "$EVENTS_LOG"
