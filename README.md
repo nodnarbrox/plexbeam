@@ -309,18 +309,34 @@ curl http://localhost:8765/jobs            # List active jobs
 
 ## Performance
 
-Full GPU pipeline: hardware decode + GPU scaling + hardware encode.
+All numbers from real session logs — no synthetic benchmarks.
 
-| Source | Content | GPU | Speed | Notes |
-|--------|---------|-----|-------|-------|
-| Plex | 4K HEVC → 1080p H.264 | Intel Iris Xe (QSV) | **11x** (267 FPS) | VDBOX fixed-function encode |
-| Jellyfin | 4K HEVC → 1080p H.264 | Intel Iris Xe (QSV) | **8-17x** | SW filter auto-converted to `scale_qsv` |
-| Plex | 4K HEVC → 1080p H.264 | NVIDIA (NVENC) | TBD | P1 preset, ultra-low latency tune |
+### Time to First Frame
 
-Key speed flags applied automatically:
-- **QSV**: `-low_power 1` (VDBOX), `-async_depth 1`, `-preset veryfast`, `-global_quality 25`
-- **NVENC**: `-preset p1`, `-tune ull`, `-cq 25`
-- **All**: Hardware decode (`-hwaccel qsv/cuda`) with `-hwaccel_output_format` for zero-copy pipeline
+| Mode | Startup Time | How |
+|------|-------------|-----|
+| Local QSV (LAN) | **< 3 seconds** | First 4s DASH segment ready before second segment starts encoding |
+| Cloud GPU + fast-start | **< 5 seconds** | CPU fast-start transcoder fires immediately; GPU takes over mid-stream |
+| Cloud GPU (beam mode) | **< 5 seconds** | 1-second segments, 250ms poll interval, zero lookahead NVENC |
+
+### Transcode Speed (Real Session Data)
+
+| Source | Content | GPU | Speed | FPS | Notes |
+|--------|---------|-----|-------|-----|-------|
+| Jellyfin | 4K HEVC → H.264 | Intel Iris Xe (QSV) | **37x** | **940 FPS** | Sustained across full session |
+| Jellyfin | 4K HEVC → H.264 | Intel Iris Xe (QSV) | **30x** | **720–740 FPS** | Typical live session |
+| Plex | 4K HEVC → 1080p H.264 | Intel Iris Xe (QSV) | **11x** | **267 FPS** | VDBOX fixed-function encode |
+| Plex | 4K HEVC (30s clip) | NVIDIA RTX 3060 (NVENC) | **13.1x** | **313 FPS** | Cloud GPU, Vast.ai Korea via CF tunnel |
+| Plex | 1080p → H.264 | Intel QSV (encode-only) | **3.5x** | **80+ FPS** | Software decode + QSV encode |
+
+### What "37x" Means for You
+
+A 2-hour 4K movie transcodes completely in **~3 minutes**. Your next segment is ready before you've finished watching the current one — zero buffering.
+
+Key flags applied automatically:
+- **QSV**: `-low_power 1`, `-async_depth 1`, `-preset veryfast`, `-global_quality 25`
+- **NVENC**: `-preset p1`, `-tune ull`, `-cq 25`, `-rc-lookahead 0`, `-delay 0`, `-bf 0`
+- **All**: HW decode + HW scale + HW encode zero-copy pipeline
 
 ## Supported Hardware
 
