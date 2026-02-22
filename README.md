@@ -33,6 +33,19 @@ A modern revival of the legendary [plex-remote-transcoder](https://github.com/wn
 - **Automatic fallback** -- gracefully falls back to local transcoding if the worker is down
 - **Orphan job reaper** -- detects and kills stale ffmpeg processes when clients disconnect
 
+## 🚀 Managed Cloud Service — Pre-Beta Signup
+
+**Don't want to manage your own GPU worker?** We're launching **[BeamStreams](https://plexbeam.com)** — a hosted service that handles the GPU infrastructure for you.
+
+- Dedicated RTX 4090 GPU workers, fully managed
+- Works with **Plex and Jellyfin** — just install the cartridge and point it at your worker URL
+- From **$19/month** for 1 concurrent transcode
+- **50% off** for early adopters during pre-beta
+
+> **[Join the pre-beta waitlist at plexbeam.com →](https://plexbeam.com#waitlist)**
+
+---
+
 ## How It Works
 
 ```
