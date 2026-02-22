@@ -35,12 +35,19 @@ A modern revival of the legendary [plex-remote-transcoder](https://github.com/wn
 
 ## 🚀 Managed Cloud Service — Pre-Beta Signup
 
-**Don't want to manage your own GPU worker?** We're launching **[BeamStreams](https://plexbeam.com)** — a hosted service that handles the GPU infrastructure for you.
+**Don't want to manage any of this yourself?** We're launching **[BeamStreams](https://plexbeam.com)** — a fully managed service that handles everything for you.
 
+### GPU Transcoding Workers
 - Dedicated RTX 4090 GPU workers, fully managed
-- Works with **Plex and Jellyfin** — just install the cartridge and point it at your worker URL
+- Works with **Plex and Jellyfin** — install the cartridge, point it at your worker URL, done
 - From **$19/month** for 1 concurrent transcode
 - **50% off** for early adopters during pre-beta
+
+### Turnkey Plex Setups with Infinite Storage
+- **Pre-configured Plex server** — we set it up, you just log in and watch
+- **Infinite storage** — backed by cloud storage solutions with petabytes of capacity, no drive to fill up, no NAS to maintain
+- Access any content without storing anything locally
+- GPU transcoding included — 4K on any device, any connection speed
 
 > **[Join the pre-beta waitlist at plexbeam.com →](https://plexbeam.com#waitlist)**
 
